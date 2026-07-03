@@ -1,7 +1,46 @@
 import { Router, type IRouter } from "express";
 import { Expo, type ExpoPushMessage } from "expo-server-sdk";
-import { getCurrentNodeStatus, getTasks, computeEarnings } from "../lib/nodeState.js";
 import { checkForOfflineNodes } from "../lib/nodeOfflineWatcher.js";
+import { db, nodesTable, tasksTable } from "@workspace/db";
+import { eq, and, gte } from "drizzle-orm";
+
+// nodeId strings everywhere in this module are the public "vf-node-{id}"
+// format returned by GET /nodes/status — parse back to the numeric DB id so
+// alerts can be scoped to that one node's real data, never the platform-wide
+// total.
+function parseNodeIdNumber(nodeId: string): number | null {
+  const match = /^vf-node-(\d+)$/.exec(nodeId);
+  if (!match) return null;
+  return parseInt(match[1]!, 10);
+}
+
+async function getRealNodeStatus(nodeIdNum: number): Promise<"online" | "offline" | "syncing" | null> {
+  const [node] = await db.select().from(nodesTable).where(eq(nodesTable.id, nodeIdNum)).limit(1);
+  if (!node) return null;
+  const ONLINE_WINDOW_MS = 90_000;
+  const lastSeenMs = node.lastSeenAt ? new Date(node.lastSeenAt).getTime() : null;
+  const isOnline = node.verified && lastSeenMs !== null && Date.now() - lastSeenMs < ONLINE_WINDOW_MS;
+  return isOnline ? "online" : node.verified ? "offline" : "syncing";
+}
+
+async function getRecentFailedTaskIds(nodeIdNum: number): Promise<string[]> {
+  const rows = await db
+    .select({ taskId: tasksTable.taskId })
+    .from(tasksTable)
+    .where(and(eq(tasksTable.assignedNodeId, nodeIdNum), eq(tasksTable.status, "failed")));
+  return rows.map((r) => r.taskId);
+}
+
+async function getEarningsTodayUsdc(nodeIdNum: number): Promise<number> {
+  const todayStart = new Date();
+  todayStart.setUTCHours(0, 0, 0, 0);
+  const rows = await db
+    .select({ rewardMicros: tasksTable.nodeRewardUsdcMicros })
+    .from(tasksTable)
+    .where(and(eq(tasksTable.assignedNodeId, nodeIdNum), gte(tasksTable.createdAt, todayStart)));
+  const totalMicros = rows.reduce((sum, r) => sum + r.rewardMicros, 0);
+  return totalMicros / 1_000_000;
+}
 
 const router: IRouter = Router();
 const expo = new Expo();
@@ -44,15 +83,18 @@ async function runPollerTick(): Promise<void> {
   );
   if (records.length === 0) return;
 
-  const nodeStatus = getCurrentNodeStatus();
-  const { tasks: allTasks } = getTasks(100, "all");
-  const earningsToday = parseFloat(computeEarnings());
   const oneHourMs = 60 * 60 * 1000;
 
+  // Each registered push token is tied to a specific contributor's own node,
+  // so every alert below is computed fresh, per-record, from that node's real
+  // data — never a shared/global snapshot that would leak one node's status
+  // or earnings into another contributor's notifications.
   for (const record of records) {
-    if (record.nodeId !== nodeStatus.nodeId) continue;
+    const nodeIdNum = parseNodeIdNumber(record.nodeId);
+    if (nodeIdNum === null) continue;
 
-    const currentStatus = nodeStatus.status;
+    const currentStatus = await getRealNodeStatus(nodeIdNum);
+    if (currentStatus === null) continue;
 
     if (currentStatus !== record.previousNodeStatus) {
       const nowOffline = currentStatus === "offline";
@@ -73,17 +115,16 @@ async function runPollerTick(): Promise<void> {
     }
 
     if (record.alertOnFailure) {
-      const newFailures = allTasks.filter(
-        (t) => t.status === "failed" && !record.seenFailedTaskIds.has(t.id)
-      );
-      for (const task of newFailures) {
-        record.seenFailedTaskIds.add(task.id);
+      const failedIds = await getRecentFailedTaskIds(nodeIdNum);
+      const newFailureIds = failedIds.filter((id) => !record.seenFailedTaskIds.has(id));
+      for (const taskId of newFailureIds) {
+        record.seenFailedTaskIds.add(taskId);
         await sendPushMessages([{
           to: record.token,
           title: "❌ Task Failed",
-          body: `Task "${task.type}" failed on node ${record.nodeId}. No VRF deducted.`,
+          body: `A task failed on node ${record.nodeId}. No reward was earned for it.`,
           sound: "default",
-          data: { type: "task_failure", taskId: task.id, nodeId: record.nodeId },
+          data: { type: "task_failure", taskId, nodeId: record.nodeId },
         }]);
       }
     }
@@ -91,17 +132,18 @@ async function runPollerTick(): Promise<void> {
     if (record.alertOnEarnings && record.earningsThreshold > 0) {
       const nowMs = Date.now();
       const sinceLastAlert = nowMs - record.lastEarningsAlert;
+      const earningsTodayUsdc = await getEarningsTodayUsdc(nodeIdNum);
 
       if (
-        earningsToday >= record.earningsThreshold &&
+        earningsTodayUsdc >= record.earningsThreshold &&
         sinceLastAlert > oneHourMs
       ) {
         await sendPushMessages([{
           to: record.token,
           title: "💰 Earnings Milestone",
-          body: `You've earned ${earningsToday.toFixed(2)} VRF today on node ${record.nodeId}!`,
+          body: `You've earned $${earningsTodayUsdc.toFixed(2)} USDC today on node ${record.nodeId}!`,
           sound: "default",
-          data: { type: "earnings_threshold", amount: earningsToday, nodeId: record.nodeId },
+          data: { type: "earnings_threshold", amount: earningsTodayUsdc, nodeId: record.nodeId },
         }]);
         record.lastEarningsAlert = nowMs;
       }
@@ -113,7 +155,7 @@ setInterval(() => {
   runPollerTick().catch(() => {});
 }, 30_000);
 
-router.post("/nodes/push-token", (req, res) => {
+router.post("/nodes/push-token", async (req, res) => {
   const {
     token,
     nodeId,
@@ -133,13 +175,10 @@ router.post("/nodes/push-token", (req, res) => {
   }
 
   const existing = tokenRegistry.get(token);
+  const nodeIdNum = parseNodeIdNumber(nodeId);
 
-  const { tasks: allTasks } = getTasks(100, "all");
-  const currentFailedIds = new Set(
-    allTasks.filter((t) => t.status === "failed").map((t) => t.id)
-  );
-
-  const nodeStatus = getCurrentNodeStatus();
+  const currentFailedIds = nodeIdNum !== null ? new Set(await getRecentFailedTaskIds(nodeIdNum)) : new Set<string>();
+  const currentStatus = nodeIdNum !== null ? await getRealNodeStatus(nodeIdNum) : null;
 
   tokenRegistry.set(token, {
     token,
@@ -151,7 +190,7 @@ router.post("/nodes/push-token", (req, res) => {
     registeredAt: Date.now(),
     seenFailedTaskIds: existing?.seenFailedTaskIds ?? currentFailedIds,
     lastEarningsAlert: existing?.lastEarningsAlert ?? 0,
-    previousNodeStatus: existing?.previousNodeStatus ?? nodeStatus.status,
+    previousNodeStatus: existing?.previousNodeStatus ?? currentStatus ?? "syncing",
   });
 
   res.json({ ok: true });

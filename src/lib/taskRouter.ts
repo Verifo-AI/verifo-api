@@ -99,12 +99,17 @@ export async function findAvailableNode(): Promise<{ id: number; clerkUserId: st
     // operated fallback nodes (isPlatformNode) are only ever picked when no real
     // contributor is online, so genuine contributors get first shot at task
     // rewards and platform capacity is strictly a last-resort safety net.
+    // Within each tier, ordering is randomized (second sort key) so every
+    // eligible online node gets a fair, equal chance at the task instead of
+    // the same node winning every time — this is what actually distributes
+    // rewards across all active contributors instead of starving the rest.
     .orderBy(
       sql`case
         when ${nodesTable.contributionMode} = 'compute' and ${nodesTable.isPlatformNode} = false then 0
         when ${nodesTable.contributionMode} = 'relay' and ${nodesTable.isPlatformNode} = false then 1
         else 2
-      end`
+      end`,
+      sql`random()`
     )
     .limit(1);
 

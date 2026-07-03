@@ -5,7 +5,6 @@ import { tasksTable, creditsTable, nodesTable } from "@workspace/db/schema";
 import { eq, desc, and, sql } from "drizzle-orm";
 import { anthropic } from "@workspace/integrations-anthropic-ai";
 import { findAvailableNode, assignTaskToNode, finalizeReward } from "../lib/taskRouter";
-import { addCompletedTask } from "../lib/nodeState";
 import { BROWSER_MODE_REWARD_MULTIPLIER } from "../lib/contributionMode";
 
 // Fase 3: real USDC value backing each credit, matching the topup packages in
@@ -114,6 +113,20 @@ router.post("/tasks", requireAuth, async (req: any, res) => {
     const ENGLISH_ONLY_INSTRUCTION =
       " Always respond in English, regardless of the language the user writes in. If asked to translate into another language, the translated text itself may be in that language, but all of your own explanations and surrounding text must stay in English.";
 
+    // Ground the model in what it's actually running on: Verifo, a
+    // decentralized AI compute network on Solana. Community-run contributor
+    // nodes (compute/relay/witness) serve inference requests and earn real
+    // USDC rewards, with on-chain proof-of-activity for every completed task.
+    // Without this, the model has no idea it's part of Verifo and can give
+    // generic or flatly wrong answers if asked about the platform itself.
+    const VERIFO_CONTEXT =
+      " You are running as part of Verifo, a decentralized AI compute network built on Solana. " +
+      "Requests like this one are served by a distributed network of community-run contributor nodes " +
+      "(compute nodes that run models locally, relay nodes that forward requests, and witness nodes that " +
+      "attest to uptime), which earn real USDC rewards for their work, with on-chain proof-of-activity " +
+      "recorded for transparency. If the user asks what Verifo is, how it works, or about contributing a " +
+      "node, explain it accurately based on this description rather than guessing.";
+
     const systemPrompt =
       (type === "coding"
         ? "You are an expert software engineer. Provide clean, well-commented code with explanations."
@@ -122,7 +135,8 @@ router.post("/tasks", requireAuth, async (req: any, res) => {
         : type === "research"
         ? "You are a research assistant. Provide thorough analysis with key insights."
         : "You are a helpful, knowledgeable assistant. Provide clear, accurate, and thoughtful responses.") +
-      ENGLISH_ONLY_INSTRUCTION;
+      ENGLISH_ONLY_INSTRUCTION +
+      VERIFO_CONTEXT;
 
     const taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 
@@ -196,10 +210,8 @@ router.post("/tasks", requireAuth, async (req: any, res) => {
     // back to Claude. A node that never responded (timeout) earns nothing.
     let nodeRewardMicros = 0;
     if (source === "local_model" && assignedNodeId !== null) {
-      addCompletedTask("Inference: LLM Batch", parseFloat((creditsUsed * 0.08).toFixed(2)));
       nodeRewardMicros = await creditNodeReward(assignedNodeId, LOCAL_MODEL_REWARD_SHARE, creditsUsed);
     } else if (nodeRelayed && assignedNodeId !== null) {
-      addCompletedTask("Relayed to Claude (fallback)", parseFloat((creditsUsed * 0.02).toFixed(2)));
       nodeRewardMicros = await creditNodeReward(assignedNodeId, RELAY_REWARD_SHARE, creditsUsed);
     }
     if (nodeRewardMicros > 0) {
@@ -252,10 +264,59 @@ router.get("/tasks/:taskId", requireAuth, async (req: any, res) => {
     if (!task) return res.status(404).json({ error: "Task not found" });
 
     const totalPaidUsdcMicros = task.creditsUsed * CREDIT_USDC_MICROS;
+
+    // Surface who actually did the work — real identity of the contributor
+    // node that ran or relayed this task, never raw keys/secrets, so the
+    // proof page can show a proper "who ran this" panel instead of a bare
+    // internal node id.
+    let contributorNode: {
+      nodeId: string;
+      contributionMode: string | null;
+      clientType: string;
+      isPlatformNode: boolean;
+      walletAddress: string;
+      os: string | null;
+      hardwareSummary: string | null;
+    } | null = null;
+
+    if (task.assignedNodeId != null) {
+      const [node] = await db
+        .select({
+          id: nodesTable.id,
+          contributionMode: nodesTable.contributionMode,
+          clientType: nodesTable.clientType,
+          isPlatformNode: nodesTable.isPlatformNode,
+          walletAddress: nodesTable.walletAddress,
+          reportedOs: nodesTable.reportedOs,
+          reportedCpu: nodesTable.reportedCpu,
+          reportedGpu: nodesTable.reportedGpu,
+          reportedRamGb: nodesTable.reportedRamGb,
+        })
+        .from(nodesTable)
+        .where(eq(nodesTable.id, task.assignedNodeId))
+        .limit(1);
+
+      if (node) {
+        const wallet = node.walletAddress;
+        const walletTruncated = wallet.length > 10 ? `${wallet.slice(0, 4)}...${wallet.slice(-4)}` : wallet;
+        const hardwareParts = [node.reportedCpu, node.reportedGpu, node.reportedRamGb ? `${node.reportedRamGb}GB RAM` : null].filter(Boolean);
+        contributorNode = {
+          nodeId: `vf-node-${node.id}`,
+          contributionMode: node.contributionMode,
+          clientType: node.clientType,
+          isPlatformNode: node.isPlatformNode,
+          walletAddress: walletTruncated,
+          os: node.reportedOs,
+          hardwareSummary: hardwareParts.length > 0 ? hardwareParts.join(" · ") : null,
+        };
+      }
+    }
+
     res.json({
       ...task,
       totalPaidUsdcMicros,
       treasuryUsdcMicros: Math.max(0, totalPaidUsdcMicros - task.nodeRewardUsdcMicros),
+      contributorNode,
     });
   } catch (err) {
     console.error("GET /tasks/:taskId error:", err);
