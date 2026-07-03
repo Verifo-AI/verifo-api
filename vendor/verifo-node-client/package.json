@@ -1,0 +1,21 @@
+{
+  "name": "@workspace/verifo-node-client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Verifo contributor node client — reports real hardware and proves it is online via signed heartbeats.",
+  "bin": {
+    "verifo-node": "./bin/verifo-node.mjs"
+  },
+  "scripts": {
+    "start": "node ./bin/verifo-node.mjs",
+    "package": "node ./scripts/build-dist.mjs"
+  },
+  "dependencies": {
+    "bs58": "^6.0.0",
+    "tweetnacl": "^1.0.3"
+  },
+  "devDependencies": {
+    "esbuild": "0.27.3"
+  }
+}
