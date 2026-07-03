@@ -15,6 +15,7 @@ import bs58 from "bs58";
 import { db, nodesTable, platformNodeCredentialsTable } from "@workspace/db";
 import { eq } from "drizzle-orm";
 import { logger } from "./lib/logger";
+import { decryptSecret } from "./lib/credentialsCrypto";
 
 const API_BASE = `http://localhost:${process.env["PORT"] ?? "8080"}/api`;
 const HEARTBEAT_INTERVAL_MS = 25_000;
@@ -107,7 +108,7 @@ async function loadIdentities(): Promise<PlatformNodeIdentity[]> {
     .map((r) => ({
       nodeId: r.nodeId,
       nodePublicKey: r.nodePublicKey,
-      secretKey: new Uint8Array(Buffer.from(r.nodeSecretKeyBase64, "base64")),
+      secretKey: new Uint8Array(Buffer.from(decryptSecret(r.nodeSecretKeyBase64), "base64")),
     }));
 }
 

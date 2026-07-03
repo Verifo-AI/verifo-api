@@ -12,6 +12,7 @@ import bs58 from "bs58";
 import { Keypair } from "@solana/web3.js";
 import { db, nodesTable, platformNodeCredentialsTable } from "@workspace/db";
 import { eq } from "drizzle-orm";
+import { encryptSecret } from "../src/lib/credentialsCrypto";
 
 const PLATFORM_NODE_COUNT = 16;
 
@@ -72,8 +73,8 @@ async function main() {
 
     await db.insert(platformNodeCredentialsTable).values({
       nodeId: node!.id,
-      nodeSecretKeyBase64,
-      walletSecretKeyBase58,
+      nodeSecretKeyBase64: encryptSecret(nodeSecretKeyBase64),
+      walletSecretKeyBase58: encryptSecret(walletSecretKeyBase58),
     });
 
     created.push({ nodeId: node!.id, nodePublicKey, walletAddress });
