@@ -4,12 +4,27 @@ import { db } from "@workspace/db";
 import { nodesTable, nodeProofEventsTable, tasksTable } from "@workspace/db/schema";
 import { eq, and, desc, inArray } from "drizzle-orm";
 import { authenticateNodeRequest } from "./nodeClient";
-import { buildMemoText, buildUnsignedProofMessage, finalizeAndSubmitProof, type ProofEventType, type TaskCompletedSettlement } from "../lib/solanaProofs";
+import { buildMemoText, buildUnsignedProofMessage, buildAndSubmitTreasuryOnlyProof, finalizeAndSubmitProof, type ProofEventType, type TaskCompletedSettlement } from "../lib/solanaProofs";
 import { CREDIT_USDC_MICROS } from "./tasks";
 
 const router = Router();
 
 const VALID_EVENT_TYPES: ProofEventType[] = ["connect", "disconnect", "task_assigned", "task_completed"];
+
+// If the contributor node never manages to co-sign its own task_completed
+// proof within this window (offline, crashed, flaky connection after
+// finishing the task), the user should still see a real tx hash instead of
+// waiting forever. After the timeout, the treasury broadcasts the same
+// settlement memo alone and the proof is marked confirmed. Real work, real
+// USDC reward and real on-chain settlement facts either way — only the
+// *co-signature* is skipped when the node itself is unreachable.
+const NODE_COSIGN_TIMEOUT_MS = 15_000;
+
+async function fallbackToTreasuryOnlyProof(memoText: string): Promise<{ txSignature: string; memoText: string }> {
+  const fallbackMemoText = `${memoText} (node did not co-sign in time; treasury attests alone)`;
+  const txSignature = await buildAndSubmitTreasuryOnlyProof(fallbackMemoText);
+  return { txSignature, memoText: fallbackMemoText };
+}
 
 // Fase 5: the node CLI calls this the moment a real event happens (connect,
 // disconnect, task picked up, task completed). The server builds a real
@@ -157,12 +172,68 @@ router.get("/tasks/:taskId/proof", requireAuth, async (req: any, res) => {
       .limit(1);
     if (!task) return res.status(404).json({ error: "Task not found" });
 
-    const [proof] = await db
+    let [proof] = await db
       .select()
       .from(nodeProofEventsTable)
       .where(and(eq(nodeProofEventsTable.taskId, taskId), eq(nodeProofEventsTable.eventType, "task_completed")))
       .orderBy(desc(nodeProofEventsTable.createdAt))
       .limit(1);
+
+    // A node was assigned to this task but never produced (or never
+    // finished) a co-signed proof. Instead of leaving the user staring at
+    // "waiting for the node to co-sign" forever with no tx hash, resolve it
+    // via a treasury-only attestation once it's clearly stuck.
+    const referenceTime = proof?.createdAt ?? task.completedAt;
+    const stuck =
+      task.assignedNodeId != null &&
+      task.completedAt != null &&
+      (!proof || proof.status === "pending_signature") &&
+      referenceTime != null &&
+      Date.now() - new Date(referenceTime).getTime() > NODE_COSIGN_TIMEOUT_MS;
+
+    if (stuck) {
+      const totalPaidMicros = task.creditsUsed * CREDIT_USDC_MICROS;
+      const rewardMicros = task.nodeRewardUsdcMicros ?? 0;
+      const [node] = await db
+        .select({ nodePublicKey: nodesTable.nodePublicKey })
+        .from(nodesTable)
+        .where(eq(nodesTable.id, task.assignedNodeId!))
+        .limit(1);
+      const baseMemoText =
+        proof?.memoText ??
+        buildMemoText("task_completed", node?.nodePublicKey ?? "unknown", taskId, {
+          totalPaidUsdc: totalPaidMicros / 1_000_000,
+          rewardUsdc: rewardMicros / 1_000_000,
+          treasuryUsdc: Math.max(0, totalPaidMicros - rewardMicros) / 1_000_000,
+        });
+      try {
+        const { txSignature, memoText } = await fallbackToTreasuryOnlyProof(baseMemoText);
+        if (proof) {
+          [proof] = await db
+            .update(nodeProofEventsTable)
+            .set({ status: "confirmed", txSignature, memoText, confirmedAt: new Date() })
+            .where(eq(nodeProofEventsTable.id, proof.id))
+            .returning();
+        } else {
+          [proof] = await db
+            .insert(nodeProofEventsTable)
+            .values({
+              nodeId: task.assignedNodeId!,
+              taskId,
+              eventType: "task_completed",
+              status: "confirmed",
+              memoText,
+              unsignedMessageBase64: "",
+              txSignature,
+              confirmedAt: new Date(),
+            })
+            .returning();
+        }
+      } catch (fallbackErr: any) {
+        console.error("Treasury-only proof fallback failed:", fallbackErr);
+        // Leave the existing pending/null proof as-is; the next poll will retry.
+      }
+    }
 
     res.json({ proof: proof || null });
   } catch (err) {

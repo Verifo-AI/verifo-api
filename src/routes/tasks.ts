@@ -11,8 +11,14 @@ import { BROWSER_MODE_REWARD_MULTIPLIER } from "../lib/contributionMode";
 // credits.ts (e.g. pack_100: 100 credits for $1 => 1 credit = $0.01). Reward
 // shares are a fraction of that real dollar value, in micro-USDC (1e6 = $1).
 export const CREDIT_USDC_MICROS = 10_000; // $0.01 per credit
-export const LOCAL_MODEL_REWARD_SHARE = 0.5; // node ran the model itself
-export const RELAY_REWARD_SHARE = 0.1; // node responded honestly but had to relay
+// Flat 70/30 split: any node that actually did real work for a task (ran the
+// model locally, or honestly relayed/attempted it) earns 70% of what the
+// user paid; the remaining 30% covers platform costs (inference API bills,
+// infra, treasury). This applies uniformly regardless of whether the node
+// ran the model itself or relayed — see verifo-payment-splits memory doc for
+// why this replaced the old two-tier 50%/10% shares.
+export const NODE_REWARD_SHARE = 0.7; // contributor node's share of the task price
+export const TREASURY_SHARE = 1 - NODE_REWARD_SHARE; // platform's share
 
 // Shared with nodeProofs.ts so the on-chain task_completed memo can quote the
 // exact real reward amount instead of a generic message.
@@ -21,11 +27,8 @@ export function computeRewardMicros(
   creditsUsed: number,
   clientType: string | null | undefined
 ): number {
-  let share: number;
-  if (source === "local_model") share = LOCAL_MODEL_REWARD_SHARE;
-  else if (source === "relayed") share = RELAY_REWARD_SHARE;
-  else return 0;
-  const effectiveShare = clientType === "browser" ? share * BROWSER_MODE_REWARD_MULTIPLIER : share;
+  if (source !== "local_model" && source !== "relayed") return 0;
+  const effectiveShare = clientType === "browser" ? NODE_REWARD_SHARE * BROWSER_MODE_REWARD_MULTIPLIER : NODE_REWARD_SHARE;
   return Math.round(creditsUsed * CREDIT_USDC_MICROS * effectiveShare);
 }
 
@@ -50,12 +53,16 @@ async function creditNodeReward(nodeId: number, share: number, creditsUsed: numb
 
 const router = Router();
 
+// Priced to actually cover real inference cost + a sustainable contributor
+// reward: each task now costs 10-30 credits ($0.10-$0.30) depending on
+// complexity, instead of the old $0.03-$0.12 range which was too cheap to
+// fund a real 70% node payout once actual USDC starts moving.
 const CREDIT_COST: Record<string, number> = {
-  chat: 3,
-  coding: 5,
-  image_generation: 12,
-  translation: 4,
-  research: 6,
+  chat: 10,
+  translation: 12,
+  research: 18,
+  coding: 20,
+  image_generation: 30,
 };
 
 async function getOrCreateCredits(userId: string) {
@@ -205,14 +212,15 @@ router.post("/tasks", requireAuth, async (req: any, res) => {
       })
       .returning();
 
-    // Reward the contributor node for real work: full credit for running the
-    // model locally, a smaller relay credit if it engaged but had to fall
-    // back to Claude. A node that never responded (timeout) earns nothing.
+    // Reward the contributor node for real work: flat 70% of what the user
+    // paid, whether the node ran the model locally or honestly relayed it.
+    // A node that never responded at all (timeout) earns nothing — nothing
+    // was contributed. See NODE_REWARD_SHARE above for the split rationale.
     let nodeRewardMicros = 0;
     if (source === "local_model" && assignedNodeId !== null) {
-      nodeRewardMicros = await creditNodeReward(assignedNodeId, LOCAL_MODEL_REWARD_SHARE, creditsUsed);
+      nodeRewardMicros = await creditNodeReward(assignedNodeId, NODE_REWARD_SHARE, creditsUsed);
     } else if (nodeRelayed && assignedNodeId !== null) {
-      nodeRewardMicros = await creditNodeReward(assignedNodeId, RELAY_REWARD_SHARE, creditsUsed);
+      nodeRewardMicros = await creditNodeReward(assignedNodeId, NODE_REWARD_SHARE, creditsUsed);
     }
     if (nodeRewardMicros > 0) {
       await db.update(tasksTable).set({ nodeRewardUsdcMicros: nodeRewardMicros }).where(eq(tasksTable.id, task!.id));
