@@ -196,6 +196,22 @@ async function runNode(identity: PlatformNodeIdentity): Promise<void> {
 }
 
 async function main() {
+  // Platform fallback nodes are real infrastructure meant to run once, in
+  // production, staying online continuously. In development the workflow
+  // restarts constantly (every code change/checkpoint), which used to make
+  // all 16 nodes flap offline/online on every restart — each flap broadcasts
+  // a real Solana mainnet transaction (paid for by the treasury wallet) for
+  // "node_offline" and "connect". That is pure wasted gas with zero real
+  // routing benefit, since dev traffic never actually needs the fallback
+  // capacity. So this worker only does real network/on-chain work when
+  // running in production; in dev it stays idle and does nothing.
+  if (process.env.NODE_ENV !== "production") {
+    logger.warn(
+      "platform-nodes-worker is disabled outside production (NODE_ENV != 'production') to avoid burning real on-chain gas on every dev restart. It will idle without sending heartbeats or proofs."
+    );
+    return;
+  }
+
   const identities = await loadIdentities();
   if (identities.length === 0) {
     logger.error("No platform node identities found in DB. Run scripts/seedPlatformNodes.ts first.");
