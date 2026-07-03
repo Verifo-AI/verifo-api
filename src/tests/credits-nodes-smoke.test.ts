@@ -164,7 +164,7 @@ test("POST /api/credits/topup succeeds against test database and returns credits
   assert.equal(data.success, true, "success should be true");
   assert.equal(typeof data.credits, "number", "credits should be a number");
   assert.ok(data.credits > 0, "credits should be positive");
-  assert.equal(data.added, 100, "should have added 100 credits (pack_100)");
+  assert.equal(data.added, 10_000, "should have added 10,000 credits (pack_100)");
   assert.equal(data.package, "Starter", "package label should be Starter");
 });
 

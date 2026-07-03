@@ -10,11 +10,17 @@ import { connection } from "../lib/solanaTreasury";
 
 const router = Router();
 
+// Credit counts here are 100x the old amounts to match the CREDIT_USDC_MICROS
+// change in tasks.ts (1 credit now = $0.0001 instead of $0.01). The USDC
+// price of each package is unchanged; only the number of credits granted
+// per dollar went up, so the real purchase rate still matches what a
+// credit is actually worth when spent on a task (keeps the 70/30 node
+// split honest end-to-end). See verifo-payment-splits memory doc.
 const USDC_PACKAGES = [
-  { id: "pack_100", usdcAmount: 1, credits: 100, label: "Starter" },
-  { id: "pack_500", usdcAmount: 4, credits: 500, label: "Pro" },
-  { id: "pack_2000", usdcAmount: 14, credits: 2000, label: "Builder" },
-  { id: "pack_10000", usdcAmount: 60, credits: 10000, label: "Enterprise" },
+  { id: "pack_100", usdcAmount: 1, credits: 10_000, label: "Starter" },
+  { id: "pack_500", usdcAmount: 4, credits: 50_000, label: "Pro" },
+  { id: "pack_2000", usdcAmount: 14, credits: 200_000, label: "Builder" },
+  { id: "pack_10000", usdcAmount: 60, credits: 1_000_000, label: "Enterprise" },
 ];
 
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";

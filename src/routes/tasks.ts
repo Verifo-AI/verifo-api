@@ -8,9 +8,12 @@ import { findAvailableNode, assignTaskToNode, finalizeReward } from "../lib/task
 import { BROWSER_MODE_REWARD_MULTIPLIER } from "../lib/contributionMode";
 
 // Fase 3: real USDC value backing each credit, matching the topup packages in
-// credits.ts (e.g. pack_100: 100 credits for $1 => 1 credit = $0.01). Reward
-// shares are a fraction of that real dollar value, in micro-USDC (1e6 = $1).
-export const CREDIT_USDC_MICROS = 10_000; // $0.01 per credit
+// credits.ts (e.g. pack_100: 10,000 credits for $1 => 1 credit = $0.0001).
+// Kept intentionally tiny so the real USDC price per task stays cheap
+// (~$0.001-$0.003) even though CREDIT_COST below still reads as a normal
+// 10-30 credit number. Reward shares are a fraction of that real dollar
+// value, in micro-USDC (1e6 = $1).
+export const CREDIT_USDC_MICROS = 100; // $0.0001 per credit
 // Flat 70/30 split: any node that actually did real work for a task (ran the
 // model locally, or honestly relayed/attempted it) earns 70% of what the
 // user paid; the remaining 30% covers platform costs (inference API bills,
@@ -53,10 +56,10 @@ async function creditNodeReward(nodeId: number, share: number, creditsUsed: numb
 
 const router = Router();
 
-// Priced to actually cover real inference cost + a sustainable contributor
-// reward: each task now costs 10-30 credits ($0.10-$0.30) depending on
-// complexity, instead of the old $0.03-$0.12 range which was too cheap to
-// fund a real 70% node payout once actual USDC starts moving.
+// Credit counts kept at a normal-feeling 10-30 range per task, but with
+// CREDIT_USDC_MICROS deliberately tiny (see above) the real USDC price per
+// task stays cheap (~$0.001-$0.003). The 70/30 split still applies to
+// whatever that real price is — see verifo-payment-splits memory doc.
 const CREDIT_COST: Record<string, number> = {
   chat: 10,
   translation: 12,
