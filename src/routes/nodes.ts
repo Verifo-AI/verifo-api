@@ -136,6 +136,9 @@ router.get("/nodes/tasks", requireAuth, async (req: any, res) => {
           reward: `$${rewardUsdc} USDC`,
           duration,
           timestamp,
+          rewardPayoutStatus: t.rewardPayoutStatus,
+          rewardTxSignature: t.rewardTxSignature,
+          rewardExplorerUrl: t.rewardTxSignature ? `https://orbmarkets.io/tx/${t.rewardTxSignature}` : null,
         };
       });
 

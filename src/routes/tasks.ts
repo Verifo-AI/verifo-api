@@ -1,12 +1,14 @@
 import { Router } from "express";
 import { requireAuth } from "../middlewares/jwtAuth";
 import { db } from "@workspace/db";
-import { tasksTable, creditsTable, nodesTable } from "@workspace/db/schema";
+import { tasksTable, creditsTable, nodesTable, payoutsTable } from "@workspace/db/schema";
 import { eq, desc, and, sql } from "drizzle-orm";
 import { anthropic } from "@workspace/integrations-anthropic-ai";
 import { generateImageBuffer } from "@workspace/integrations-openai-ai-server/image";
 import { findAvailableNode, assignTaskToNode, finalizeReward } from "../lib/taskRouter";
 import { BROWSER_MODE_REWARD_MULTIPLIER } from "../lib/contributionMode";
+import { sendUsdcPayout, isTreasuryConfigured } from "../lib/solanaTreasury";
+import { logger } from "../lib/logger";
 
 // Fase 3: real USDC value backing each credit, matching the topup packages in
 // credits.ts (e.g. pack_100: 10,000 credits for $1 => 1 credit = $0.0001).
@@ -36,23 +38,81 @@ export function computeRewardMicros(
   return Math.round(creditsUsed * CREDIT_USDC_MICROS * effectiveShare);
 }
 
-async function creditNodeReward(nodeId: number, share: number, creditsUsed: number): Promise<number> {
+export type RewardPayoutStatus = "not_applicable" | "paid" | "failed";
+
+export interface NodeRewardResult {
+  amountMicros: number;
+  status: RewardPayoutStatus;
+  txSignature: string | null;
+}
+
+// Every task that earns a node a reward now pays that node in real, on-chain
+// USDC the instant the task completes — no batching, no manual "Request
+// Payout" click required. If the on-chain send itself fails (RPC hiccup,
+// treasury underfunded, treasury wallet not configured), the amount is
+// credited to the node's pendingRewardUsdcMicros balance instead, so nothing
+// is ever lost — the node can still claim it later via the existing manual
+// payout button as a safety net.
+async function payNodeRewardOnChain(nodeId: number, share: number, creditsUsed: number): Promise<NodeRewardResult> {
   const [node] = await db
-    .select({ clientType: nodesTable.clientType })
+    .select({ clientType: nodesTable.clientType, walletAddress: nodesTable.walletAddress })
     .from(nodesTable)
     .where(eq(nodesTable.id, nodeId))
     .limit(1);
+
+  if (!node) return { amountMicros: 0, status: "not_applicable", txSignature: null };
+
   // Browser Mode nodes earn less per task, same reason as the heartbeat
   // reward: uptime tied to an open tab is inherently less reliable than a
   // dedicated CLI process, so we never promise the same reward for it.
-  const effectiveShare = node?.clientType === "browser" ? share * BROWSER_MODE_REWARD_MULTIPLIER : share;
+  const effectiveShare = node.clientType === "browser" ? share * BROWSER_MODE_REWARD_MULTIPLIER : share;
   const amountMicros = Math.round(creditsUsed * CREDIT_USDC_MICROS * effectiveShare);
-  if (amountMicros <= 0) return 0;
-  await db
-    .update(nodesTable)
-    .set({ pendingRewardUsdcMicros: sql`${nodesTable.pendingRewardUsdcMicros} + ${amountMicros}` })
-    .where(eq(nodesTable.id, nodeId));
-  return amountMicros;
+  if (amountMicros <= 0) return { amountMicros: 0, status: "not_applicable", txSignature: null };
+
+  if (!isTreasuryConfigured()) {
+    await db
+      .update(nodesTable)
+      .set({ pendingRewardUsdcMicros: sql`${nodesTable.pendingRewardUsdcMicros} + ${amountMicros}` })
+      .where(eq(nodesTable.id, nodeId));
+    return { amountMicros, status: "failed", txSignature: null };
+  }
+
+  try {
+    const signature = await sendUsdcPayout(node.walletAddress, amountMicros);
+
+    await db
+      .update(nodesTable)
+      .set({ totalPaidUsdcMicros: sql`${nodesTable.totalPaidUsdcMicros} + ${amountMicros}` })
+      .where(eq(nodesTable.id, nodeId));
+
+    await db.insert(payoutsTable).values({
+      nodeId,
+      walletAddress: node.walletAddress,
+      amountUsdcMicros: amountMicros,
+      status: "completed",
+      solanaTxSignature: signature,
+      completedAt: new Date(),
+    });
+
+    return { amountMicros, status: "paid", txSignature: signature };
+  } catch (err) {
+    logger.error({ err, nodeId, amountMicros }, "Automatic per-task USDC payout failed, queuing for manual payout instead");
+
+    await db
+      .update(nodesTable)
+      .set({ pendingRewardUsdcMicros: sql`${nodesTable.pendingRewardUsdcMicros} + ${amountMicros}` })
+      .where(eq(nodesTable.id, nodeId));
+
+    await db.insert(payoutsTable).values({
+      nodeId,
+      walletAddress: node.walletAddress,
+      amountUsdcMicros: amountMicros,
+      status: "failed",
+      errorMessage: String((err as Error)?.message ?? err),
+    });
+
+    return { amountMicros, status: "failed", txSignature: null };
+  }
 }
 
 const router = Router();
@@ -231,17 +291,28 @@ router.post("/tasks", requireAuth, async (req: any, res) => {
       .returning();
 
     // Reward the contributor node for real work: flat 70% of what the user
-    // paid, whether the node ran the model locally or honestly relayed it.
-    // A node that never responded at all (timeout) earns nothing — nothing
-    // was contributed. See NODE_REWARD_SHARE above for the split rationale.
+    // paid, whether the node ran the model locally or honestly relayed it,
+    // paid out automatically on-chain the instant the task completes (no
+    // batching, no manual claim needed). A node that never responded at all
+    // (timeout) earns nothing — nothing was contributed. See NODE_REWARD_SHARE
+    // above for the split rationale.
     let nodeRewardMicros = 0;
-    if (source === "local_model" && assignedNodeId !== null) {
-      nodeRewardMicros = await creditNodeReward(assignedNodeId, NODE_REWARD_SHARE, creditsUsed);
-    } else if (nodeRelayed && assignedNodeId !== null) {
-      nodeRewardMicros = await creditNodeReward(assignedNodeId, NODE_REWARD_SHARE, creditsUsed);
+    let rewardPayoutStatus: RewardPayoutStatus = "not_applicable";
+    let rewardTxSignature: string | null = null;
+    if ((source === "local_model" || nodeRelayed) && assignedNodeId !== null) {
+      const result = await payNodeRewardOnChain(assignedNodeId, NODE_REWARD_SHARE, creditsUsed);
+      nodeRewardMicros = result.amountMicros;
+      rewardPayoutStatus = result.status;
+      rewardTxSignature = result.txSignature;
     }
     if (nodeRewardMicros > 0) {
-      await db.update(tasksTable).set({ nodeRewardUsdcMicros: nodeRewardMicros }).where(eq(tasksTable.id, task!.id));
+      await db
+        .update(tasksTable)
+        .set({ nodeRewardUsdcMicros: nodeRewardMicros, rewardPayoutStatus, rewardTxSignature })
+        .where(eq(tasksTable.id, task!.id));
+      task!.nodeRewardUsdcMicros = nodeRewardMicros;
+      task!.rewardPayoutStatus = rewardPayoutStatus;
+      task!.rewardTxSignature = rewardTxSignature;
     }
 
     // Unblock the node's pending /nodes/task-result response (if any node was
@@ -343,6 +414,9 @@ router.get("/tasks/:taskId", requireAuth, async (req: any, res) => {
       totalPaidUsdcMicros,
       treasuryUsdcMicros: Math.max(0, totalPaidUsdcMicros - task.nodeRewardUsdcMicros),
       contributorNode,
+      // Reward payment tx hash, distinct from the task_completed proof-of-
+      // activity memo tx shown elsewhere on this page.
+      rewardExplorerUrl: task.rewardTxSignature ? `https://orbmarkets.io/tx/${task.rewardTxSignature}` : null,
     });
   } catch (err) {
     console.error("GET /tasks/:taskId error:", err);
