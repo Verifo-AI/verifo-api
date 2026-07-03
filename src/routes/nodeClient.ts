@@ -3,16 +3,55 @@ import jwt from "jsonwebtoken";
 import nacl from "tweetnacl";
 import bs58 from "bs58";
 import { requireAuth, JWT_SECRET } from "../middlewares/jwtAuth";
-import { db, nodesTable } from "@workspace/db";
+import { db, nodesTable, nodeProofEventsTable } from "@workspace/db";
 import { eq, sql } from "drizzle-orm";
 import { buildNodeClientZip } from "@workspace/verifo-node-client/scripts/build-dist.mjs";
 import { popNextTaskForNode, resolveNodeTask, waitForRewardFinalized } from "../lib/taskRouter";
+import { buildMemoText, buildAndSubmitTreasuryOnlyProof } from "../lib/solanaProofs";
+import { logger } from "../lib/logger";
 import {
   classifyContributionMode,
   WITNESS_REWARD_MICROS_PER_SECOND,
   WITNESS_REWARD_MAX_ELAPSED_SEC,
   BROWSER_MODE_REWARD_MULTIPLIER,
 } from "../lib/contributionMode";
+
+// Mirrors nodeOfflineWatcher's approach for "node_offline": the server
+// itself is the one witnessing the reconnect (the first heartbeat after a
+// node was marked offline), so it can attest to it with a treasury-only
+// proof — no node co-signature needed. This is what makes "Connected"
+// entries show up reliably in the history feed even when the CLI's own
+// co-signed connect proof never lands (offline at exactly the wrong
+// moment, RPC hiccup, killed before the two-step handshake finishes).
+async function recordAutomaticReconnectProof(nodeId: number, nodePublicKey: string): Promise<void> {
+  const memoText = buildMemoText("connect", nodePublicKey);
+  const [proofRow] = await db
+    .insert(nodeProofEventsTable)
+    .values({
+      nodeId,
+      taskId: null,
+      eventType: "connect",
+      status: "pending_signature",
+      memoText,
+      unsignedMessageBase64: "",
+    })
+    .returning();
+
+  try {
+    const txSignature = await buildAndSubmitTreasuryOnlyProof(memoText);
+    await db
+      .update(nodeProofEventsTable)
+      .set({ status: "confirmed", txSignature, confirmedAt: new Date() })
+      .where(eq(nodeProofEventsTable.id, proofRow!.id));
+    logger.info({ nodeId, txSignature }, "[nodeClient] automatic reconnect proof confirmed");
+  } catch (err: any) {
+    await db
+      .update(nodeProofEventsTable)
+      .set({ status: "failed", failureReason: err?.message || "Unknown error" })
+      .where(eq(nodeProofEventsTable.id, proofRow!.id));
+    logger.error({ err, nodeId }, "[nodeClient] failed to submit automatic reconnect proof");
+  }
+}
 
 const router: IRouter = Router();
 
@@ -253,6 +292,8 @@ router.post("/nodes/heartbeat", async (req, res) => {
       }
     }
 
+    const wasOffline = node.status !== "active";
+
     await db
       .update(nodesTable)
       .set({
@@ -264,6 +305,20 @@ router.post("/nodes/heartbeat", async (req, res) => {
           : {}),
       })
       .where(eq(nodesTable.id, node.id));
+
+    // The node's own co-signed "connect" proof (sent once at CLI startup)
+    // can be missed entirely — flaky connection, killed before the two-step
+    // handshake finishes, or the node was already offline when it tried.
+    // Since this heartbeat is itself the server directly witnessing the
+    // reconnect, record it the same reliable way node_offline is recorded:
+    // a treasury-only proof that doesn't depend on the node's cooperation.
+    // Runs after the response so a slow/flaky RPC never delays the
+    // heartbeat's own success reply to the CLI.
+    if (wasOffline) {
+      recordAutomaticReconnectProof(node.id, nodePublicKey).catch((err) => {
+        logger.error({ err, nodeId: node.id }, "[nodeClient] recordAutomaticReconnectProof threw unexpectedly");
+      });
+    }
 
     res.json({ ok: true, onlineWindowMs: ONLINE_WINDOW_MS, contributionMode: node.contributionMode });
   } catch (err) {
