@@ -21,7 +21,7 @@ const pendingAssignments = new Map<string, PendingAssignment>();
 const busyNodeIds = new Set<number>();
 
 export interface FinalizedReward {
-  source: "local_model" | "fallback_claude";
+  source: "local_model" | "fallback_claude" | "fallback_openai_image";
   rewardMicros: number;
   totalPaidMicros: number;
   treasuryMicros: number;

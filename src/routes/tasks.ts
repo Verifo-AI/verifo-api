@@ -4,6 +4,7 @@ import { db } from "@workspace/db";
 import { tasksTable, creditsTable, nodesTable } from "@workspace/db/schema";
 import { eq, desc, and, sql } from "drizzle-orm";
 import { anthropic } from "@workspace/integrations-anthropic-ai";
+import { generateImageBuffer } from "@workspace/integrations-openai-ai-server/image";
 import { findAvailableNode, assignTaskToNode, finalizeReward } from "../lib/taskRouter";
 import { BROWSER_MODE_REWARD_MULTIPLIER } from "../lib/contributionMode";
 
@@ -154,22 +155,47 @@ router.post("/tasks", requireAuth, async (req: any, res) => {
     // first. Only fall back to the central Claude API if no node is available,
     // the assigned node explicitly can't run it locally, or it never responds.
     let response: string;
-    let source: "local_model" | "fallback_claude";
+    let source: "local_model" | "fallback_claude" | "fallback_openai_image";
     let assignedNodeId: number | null = null;
     let nodeRelayed = false;
 
-    const node = await findAvailableNode();
+    if (type === "image_generation") {
+      // Claude (Anthropic) has no image-generation capability, and
+      // contributor nodes only run local text LLMs, so image tasks can never
+      // be routed to a node or Claude honestly — they always go straight to
+      // OpenAI's gpt-image-1 via an internal AI proxy. Stored as a data URL
+      // in `response` so the existing text-shaped task pipeline (DB column,
+      // proof memo, history list) doesn't need a schema change; the frontend
+      // renders it as an <img> instead of markdown for this task type.
+      const imageBuffer = await generateImageBuffer(prompt, "1024x1024");
+      response = `data:image/png;base64,${imageBuffer.toString("base64")}`;
+      source = "fallback_openai_image";
+    } else {
+      const node = await findAvailableNode();
 
-    if (node) {
-      assignedNodeId = node.id;
-      const nodeResult = await assignTaskToNode(node.id, { taskId, prompt, type });
-      if (nodeResult?.ok) {
-        response = nodeResult.output;
-        source = "local_model";
+      if (node) {
+        assignedNodeId = node.id;
+        const nodeResult = await assignTaskToNode(node.id, { taskId, prompt, type });
+        if (nodeResult?.ok) {
+          response = nodeResult.output;
+          source = "local_model";
+        } else {
+          // Either the node explicitly said it can't run this locally, or it
+          // timed out. Only credit it for relaying if it actively responded.
+          nodeRelayed = nodeResult !== null;
+          const completion = await anthropic.messages.create({
+            model,
+            max_tokens: 1024,
+            system: systemPrompt,
+            messages: [{ role: "user", content: prompt }],
+          });
+          response = completion.content
+            .filter((block) => block.type === "text")
+            .map((block) => (block as { type: "text"; text: string }).text)
+            .join("");
+          source = "fallback_claude";
+        }
       } else {
-        // Either the node explicitly said it can't run this locally, or it
-        // timed out. Only credit it for relaying if it actively responded.
-        nodeRelayed = nodeResult !== null;
         const completion = await anthropic.messages.create({
           model,
           max_tokens: 1024,
@@ -182,18 +208,6 @@ router.post("/tasks", requireAuth, async (req: any, res) => {
           .join("");
         source = "fallback_claude";
       }
-    } else {
-      const completion = await anthropic.messages.create({
-        model,
-        max_tokens: 1024,
-        system: systemPrompt,
-        messages: [{ role: "user", content: prompt }],
-      });
-      response = completion.content
-        .filter((block) => block.type === "text")
-        .map((block) => (block as { type: "text"; text: string }).text)
-        .join("");
-      source = "fallback_claude";
     }
 
     const now = new Date();
