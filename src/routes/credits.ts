@@ -3,9 +3,10 @@ import { requireAuth } from "../middlewares/jwtAuth";
 import { db } from "@workspace/db";
 import { creditsTable, topupTransactionsTable } from "@workspace/db/schema";
 import { eq } from "drizzle-orm";
-import { Connection, PublicKey } from "@solana/web3.js";
+import { PublicKey } from "@solana/web3.js";
 import { getAssociatedTokenAddress } from "@solana/spl-token";
 import { logger } from "../lib/logger";
+import { connection } from "../lib/solanaTreasury";
 
 const router = Router();
 
@@ -19,9 +20,6 @@ const USDC_PACKAGES = [
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const USDC_DECIMALS = 6;
 const TREASURY_WALLET = process.env.VERIFO_TREASURY_WALLET ?? "11111111111111111111111111111111";
-const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
-
-const connection = new Connection(SOLANA_RPC_URL, "confirmed");
 
 router.get("/credits/packages", (_req, res) => {
   res.json({ packages: USDC_PACKAGES, usdcMint: USDC_MINT, treasuryWallet: TREASURY_WALLET });

@@ -16,7 +16,20 @@ import { logger } from "./logger";
 
 export const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 export const USDC_DECIMALS = 6;
-const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
+
+// Helius is our primary Solana RPC provider (much higher rate limits than
+// the public mainnet-beta endpoint, which is what was causing 429s and
+// crashing the server under load). Falls back to SOLANA_RPC_URL or the
+// public endpoint only if HELIUS_API_KEY isn't configured.
+function resolveSolanaRpcUrl(): string {
+  const heliusKey = process.env.HELIUS_API_KEY;
+  if (heliusKey) {
+    return `https://mainnet.helius-rpc.com/?api-key=${heliusKey}`;
+  }
+  return process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
+}
+
+export const SOLANA_RPC_URL = resolveSolanaRpcUrl();
 
 export const connection = new Connection(SOLANA_RPC_URL, "confirmed");
 
