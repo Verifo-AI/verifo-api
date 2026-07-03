@@ -1,11 +1,10 @@
 import { Router } from "express";
 import { requireAuth } from "../middlewares/jwtAuth";
-import crypto from "crypto";
 import { db } from "@workspace/db";
-import { tasksTable, proofsTable, creditsTable, nodesTable } from "@workspace/db/schema";
+import { tasksTable, creditsTable, nodesTable } from "@workspace/db/schema";
 import { eq, desc, and, sql } from "drizzle-orm";
 import { anthropic } from "@workspace/integrations-anthropic-ai";
-import { findAvailableNode, assignTaskToNode } from "../lib/taskRouter";
+import { findAvailableNode, assignTaskToNode, finalizeReward } from "../lib/taskRouter";
 import { addCompletedTask } from "../lib/nodeState";
 import { BROWSER_MODE_REWARD_MULTIPLIER } from "../lib/contributionMode";
 
@@ -72,24 +71,6 @@ async function getOrCreateCredits(userId: string) {
     .values({ clerkUserId: userId, credits: 100, plan: "free" })
     .returning();
   return created;
-}
-
-function sha256(text: string) {
-  return crypto.createHash("sha256").update(text).digest("hex");
-}
-
-function generateNodeWallet() {
-  const chars = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-  let r = "";
-  for (let i = 0; i < 32; i++) r += chars[Math.floor(Math.random() * chars.length)];
-  return r;
-}
-
-function generateSolanaTxId() {
-  const chars = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-  let r = "";
-  for (let i = 0; i < 64; i++) r += chars[Math.floor(Math.random() * chars.length)];
-  return r;
 }
 
 router.get("/tasks", requireAuth, async (req: any, res) => {
@@ -191,7 +172,6 @@ router.post("/tasks", requireAuth, async (req: any, res) => {
       source = "fallback_claude";
     }
 
-    const proofId = `prf_${Math.random().toString(36).slice(2, 18)}`;
     const now = new Date();
 
     const [task] = await db
@@ -205,7 +185,6 @@ router.post("/tasks", requireAuth, async (req: any, res) => {
         status: "completed",
         creditsUsed,
         response,
-        proofId,
         source,
         assignedNodeId,
         completedAt: now,
@@ -227,27 +206,25 @@ router.post("/tasks", requireAuth, async (req: any, res) => {
       await db.update(tasksTable).set({ nodeRewardUsdcMicros: nodeRewardMicros }).where(eq(tasksTable.id, task!.id));
     }
 
-    await db.insert(proofsTable).values({
-      proofId,
-      taskId,
-      clerkUserId: req.userId,
-      modelIdentifier: model,
-      promptHashSha256: sha256(prompt),
-      outputHashSha256: sha256(response),
-      computeNodeWallet: source === "local_model" && node ? node.walletAddress : generateNodeWallet(),
-      nodeSignature: `sig_${Math.random().toString(36).slice(2, 48)}`,
-      verificationConsensus: true,
-      verifierCount: 5,
-      solanaTransactionId: generateSolanaTxId(),
-      verified: true,
-    });
+    // Unblock the node's pending /nodes/task-result response (if any node was
+    // actually involved) now that the reward is finalized and persisted. This
+    // is what makes the node's subsequent on-chain task_completed proof
+    // request safe to read final, non-racy numbers straight from the DB.
+    if (assignedNodeId !== null) {
+      finalizeReward(taskId, {
+        source,
+        rewardMicros: nodeRewardMicros,
+        totalPaidMicros: creditsUsed * CREDIT_USDC_MICROS,
+        treasuryMicros: Math.max(0, creditsUsed * CREDIT_USDC_MICROS - nodeRewardMicros),
+      });
+    }
 
     await db
       .update(creditsTable)
       .set({ credits: creditsRecord.credits - creditsUsed, updatedAt: now })
       .where(eq(creditsTable.clerkUserId, req.userId));
 
-    res.status(201).json({ ...task, proofId });
+    res.status(201).json(task);
   } catch (err) {
     console.error("POST /tasks error:", err);
     res.status(500).json({ error: "Failed to process AI task" });
@@ -261,6 +238,28 @@ router.get("/tasks/credits", requireAuth, async (req: any, res) => {
   } catch (err) {
     console.error("GET /tasks/credits error:", err);
     res.status(500).json({ error: "Failed to fetch credits" });
+  }
+});
+
+router.get("/tasks/:taskId", requireAuth, async (req: any, res) => {
+  try {
+    const { taskId } = req.params;
+    const [task] = await db
+      .select()
+      .from(tasksTable)
+      .where(and(eq(tasksTable.taskId, taskId), eq(tasksTable.clerkUserId, req.userId)))
+      .limit(1);
+    if (!task) return res.status(404).json({ error: "Task not found" });
+
+    const totalPaidUsdcMicros = task.creditsUsed * CREDIT_USDC_MICROS;
+    res.json({
+      ...task,
+      totalPaidUsdcMicros,
+      treasuryUsdcMicros: Math.max(0, totalPaidUsdcMicros - task.nodeRewardUsdcMicros),
+    });
+  } catch (err) {
+    console.error("GET /tasks/:taskId error:", err);
+    res.status(500).json({ error: "Failed to fetch task" });
   }
 });
 

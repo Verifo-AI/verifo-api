@@ -4,7 +4,8 @@ import { db } from "@workspace/db";
 import { nodesTable, nodeProofEventsTable, tasksTable } from "@workspace/db/schema";
 import { eq, and, desc, inArray } from "drizzle-orm";
 import { authenticateNodeRequest } from "./nodeClient";
-import { buildMemoText, buildUnsignedProofMessage, finalizeAndSubmitProof, type ProofEventType } from "../lib/solanaProofs";
+import { buildMemoText, buildUnsignedProofMessage, finalizeAndSubmitProof, type ProofEventType, type TaskCompletedSettlement } from "../lib/solanaProofs";
+import { CREDIT_USDC_MICROS } from "./tasks";
 
 const router = Router();
 
@@ -25,7 +26,7 @@ router.post("/nodes/proof", async (req, res) => {
     }
 
     let resolvedTaskId: string | null = null;
-    let rewardUsdc: number | null = null;
+    let settlement: TaskCompletedSettlement | null = null;
     if (eventType === "task_assigned" || eventType === "task_completed") {
       if (typeof taskId !== "string" || !taskId) {
         return res.status(400).json({ error: "taskId is required for this event type" });
@@ -35,8 +36,18 @@ router.post("/nodes/proof", async (req, res) => {
         return res.status(404).json({ error: "Task not found for this node" });
       }
       resolvedTaskId = taskId;
-      if (eventType === "task_completed" && task.nodeRewardUsdcMicros > 0) {
-        rewardUsdc = task.nodeRewardUsdcMicros / 1_000_000;
+      // For task_completed the /tasks handler already finished writing
+      // creditsUsed + nodeRewardUsdcMicros before it let the node's
+      // task-result response return (see waitForRewardFinalized), so these
+      // numbers are guaranteed final by the time we read them here.
+      if (eventType === "task_completed") {
+        const totalPaidMicros = task.creditsUsed * CREDIT_USDC_MICROS;
+        const rewardMicros = task.nodeRewardUsdcMicros ?? 0;
+        settlement = {
+          totalPaidUsdc: totalPaidMicros / 1_000_000,
+          rewardUsdc: rewardMicros / 1_000_000,
+          treasuryUsdc: Math.max(0, totalPaidMicros - rewardMicros) / 1_000_000,
+        };
       }
     }
 
@@ -45,7 +56,7 @@ router.post("/nodes/proof", async (req, res) => {
       return res.status(404).json({ error: "Node identity not found" });
     }
 
-    const memoText = buildMemoText(eventType as ProofEventType, nodeRow.nodePublicKey, resolvedTaskId, rewardUsdc);
+    const memoText = buildMemoText(eventType as ProofEventType, nodeRow.nodePublicKey, resolvedTaskId, settlement);
     const { messageBase64 } = await buildUnsignedProofMessage(nodeRow.nodePublicKey, memoText);
 
     const [proof] = await db

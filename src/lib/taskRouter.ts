@@ -20,6 +20,53 @@ interface PendingAssignment {
 const pendingAssignments = new Map<string, PendingAssignment>();
 const busyNodeIds = new Set<number>();
 
+export interface FinalizedReward {
+  source: "local_model" | "fallback_claude";
+  rewardMicros: number;
+  totalPaidMicros: number;
+  treasuryMicros: number;
+}
+
+interface PendingReward {
+  resolve: (result: FinalizedReward | null) => void;
+  timer: NodeJS.Timeout;
+}
+
+const pendingRewards = new Map<string, PendingReward>();
+
+/**
+ * Called by /nodes/task-result right after a node's response is accepted,
+ * BEFORE it replies to the node. This blocks the node's HTTP response until
+ * the original /tasks handler has finished computing and persisting the real
+ * reward for this task, which eliminates the race where a node would request
+ * its on-chain task_completed proof before the reward amount even existed in
+ * the database. Resolves to null if the reward is never finalized in time
+ * (e.g. no node was actually involved in this task).
+ */
+export function waitForRewardFinalized(taskId: string, timeoutMs = 8_000): Promise<FinalizedReward | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      pendingRewards.delete(taskId);
+      resolve(null);
+    }, timeoutMs);
+    pendingRewards.set(taskId, { resolve: (r) => resolve(r), timer });
+  });
+}
+
+/**
+ * Called by the /tasks handler once the node reward has been computed and
+ * written to the database. Unblocks any pending waitForRewardFinalized call
+ * for this taskId so the node's on-chain proof request can safely read the
+ * final numbers.
+ */
+export function finalizeReward(taskId: string, reward: FinalizedReward): void {
+  const pending = pendingRewards.get(taskId);
+  if (!pending) return;
+  clearTimeout(pending.timer);
+  pendingRewards.delete(taskId);
+  pending.resolve(reward);
+}
+
 export interface AssignedTask {
   taskId: string;
   prompt: string;

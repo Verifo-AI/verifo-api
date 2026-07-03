@@ -18,11 +18,17 @@ export const MEMO_PROGRAM_ID = new PublicKey("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqX
 export type ProofEventType = "connect" | "disconnect" | "task_assigned" | "task_completed" | "node_offline";
 
 // All memo text is English-only by design (product requirement).
+export interface TaskCompletedSettlement {
+  rewardUsdc: number;
+  totalPaidUsdc: number;
+  treasuryUsdc: number;
+}
+
 export function buildMemoText(
   eventType: ProofEventType,
   nodePublicKey: string,
   taskId?: string | null,
-  rewardUsdc?: number | null
+  settlement?: TaskCompletedSettlement | null
 ): string {
   switch (eventType) {
     case "connect":
@@ -32,8 +38,8 @@ export function buildMemoText(
     case "task_assigned":
       return `Verifo node ${nodePublicKey} picked up task ${taskId}`;
     case "task_completed":
-      return typeof rewardUsdc === "number"
-        ? `Verifo node ${nodePublicKey} completed task ${taskId}, earned ${rewardUsdc.toFixed(6)} USDC`
+      return settlement
+        ? `Verifo node ${nodePublicKey} completed task ${taskId}. Settlement: user paid ${settlement.totalPaidUsdc.toFixed(6)} USDC, node earned ${settlement.rewardUsdc.toFixed(6)} USDC, platform treasury kept ${settlement.treasuryUsdc.toFixed(6)} USDC`
         : `Verifo node ${nodePublicKey} completed task ${taskId}`;
     case "node_offline":
       return `Verifo node ${nodePublicKey} went offline (missed heartbeat)`;

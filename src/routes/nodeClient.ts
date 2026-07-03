@@ -6,7 +6,7 @@ import { requireAuth, JWT_SECRET } from "../middlewares/jwtAuth";
 import { db, nodesTable } from "@workspace/db";
 import { eq, sql } from "drizzle-orm";
 import { buildNodeClientZip } from "@workspace/verifo-node-client/scripts/build-dist.mjs";
-import { popNextTaskForNode, resolveNodeTask } from "../lib/taskRouter";
+import { popNextTaskForNode, resolveNodeTask, waitForRewardFinalized } from "../lib/taskRouter";
 import {
   classifyContributionMode,
   WITNESS_REWARD_MICROS_PER_SECOND,
@@ -320,6 +320,13 @@ router.post("/nodes/task-result", async (req, res) => {
     if (!resolved) {
       return res.status(409).json({ error: "This task already timed out or was already resolved" });
     }
+
+    // Block the response until the original /tasks handler has finished
+    // computing and persisting the real reward for this task. This makes it
+    // safe for the node to immediately request its on-chain task_completed
+    // proof right after receiving this response, without racing the reward
+    // write (see waitForRewardFinalized / finalizeReward in taskRouter.ts).
+    await waitForRewardFinalized(taskId);
 
     res.json({ ok: true });
   } catch (err) {
