@@ -1,17 +1,18 @@
 import { Router, type IRouter } from "express";
-import { SOLANA_RPC_URL } from "../lib/solanaTreasury";
+import { solanaFetch } from "../lib/solanaTreasury";
 import { logger } from "../lib/logger";
 
 const router: IRouter = Router();
 
 /**
- * Proxies Solana JSON-RPC requests to Helius (or whatever SOLANA_RPC_URL
- * resolves to) so the frontend wallet provider never needs the raw
- * HELIUS_API_KEY in browser-shipped code.
+ * Proxies Solana JSON-RPC requests to Helius (with automatic runtime
+ * fallback to the public RPC if Helius rate-limits us) so the frontend
+ * wallet provider never needs the raw HELIUS_API_KEY in browser-shipped
+ * code.
  */
 router.post("/solana-rpc", async (req, res) => {
   try {
-    const upstream = await fetch(SOLANA_RPC_URL, {
+    const upstream = await solanaFetch("solana-rpc", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(req.body),

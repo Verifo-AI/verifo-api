@@ -19,19 +19,48 @@ export const USDC_DECIMALS = 6;
 
 // Helius is our primary Solana RPC provider (much higher rate limits than
 // the public mainnet-beta endpoint, which is what was causing 429s and
-// crashing the server under load). Falls back to SOLANA_RPC_URL or the
-// public endpoint only if HELIUS_API_KEY isn't configured.
-function resolveSolanaRpcUrl(): string {
-  const heliusKey = process.env.HELIUS_API_KEY;
-  if (heliusKey) {
-    return `https://mainnet.helius-rpc.com/?api-key=${heliusKey}`;
+// crashing the server under load). PUBLIC_FALLBACK_URL is only used as a
+// last resort: either when HELIUS_API_KEY isn't configured at all, or as a
+// temporary runtime fallback if Helius itself starts returning 429s.
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
+const HELIUS_URL = HELIUS_API_KEY ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}` : null;
+const PUBLIC_FALLBACK_URL = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
+
+// How long to keep routing to the public RPC after Helius rate-limits us,
+// before trying Helius again.
+const HELIUS_COOLDOWN_MS = 30_000;
+let heliusCooldownUntil = 0;
+
+export const SOLANA_RPC_URL = HELIUS_URL || PUBLIC_FALLBACK_URL;
+
+/**
+ * Custom fetch used by the Connection (and the /api/solana-rpc proxy) that
+ * always prefers Helius. If Helius responds with 429, it retries the same
+ * request against the public RPC immediately and starts a cooldown window
+ * so subsequent requests skip Helius until it's likely to have recovered.
+ */
+export const solanaFetch: typeof fetch = async (info, init) => {
+  if (!HELIUS_URL) {
+    return fetch(PUBLIC_FALLBACK_URL, init);
   }
-  return process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
-}
 
-export const SOLANA_RPC_URL = resolveSolanaRpcUrl();
+  const useHelius = Date.now() >= heliusCooldownUntil;
+  const targetUrl = useHelius ? HELIUS_URL : PUBLIC_FALLBACK_URL;
+  let response = await fetch(targetUrl, init);
 
-export const connection = new Connection(SOLANA_RPC_URL, "confirmed");
+  if (response.status === 429 && useHelius) {
+    logger.warn(
+      { cooldownMs: HELIUS_COOLDOWN_MS },
+      "Helius RPC rate-limited (429), falling back to public Solana RPC temporarily",
+    );
+    heliusCooldownUntil = Date.now() + HELIUS_COOLDOWN_MS;
+    response = await fetch(PUBLIC_FALLBACK_URL, init);
+  }
+
+  return response;
+};
+
+export const connection = new Connection(SOLANA_RPC_URL, { commitment: "confirmed", fetch: solanaFetch });
 
 function parseTreasuryKeypair(): Keypair | null {
   const raw = process.env.TREASURY_WALLET_PRIVATE_KEY;
