@@ -142,7 +142,8 @@ router.post("/tasks", requireAuth, async (req: any, res) => {
       (type === "coding"
         ? "You are an expert software engineer. Provide clean, well-commented code with explanations."
         : type === "translation"
-        ? "You are a professional translator. Provide accurate, natural-sounding translations."
+        ? "You are a professional translator. Provide accurate, natural-sounding translations. " +
+          "If the user's request does not specify a target language, translate into Russian by default."
         : type === "research"
         ? "You are a research assistant. Provide thorough analysis with key insights."
         : "You are a helpful, knowledgeable assistant. Provide clear, accurate, and thoughtful responses.") +
