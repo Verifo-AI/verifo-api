@@ -24,6 +24,31 @@ export interface TaskCompletedSettlement {
   treasuryUsdc: number;
 }
 
+// For task_completed proofs, the requesting user's wallet and the earning
+// node's reward wallet are attached to the transaction as plain (non-signer,
+// non-writable) accounts. The treasury still pays gas and is the only
+// required signer, but this makes the payer/payee relationship an on-chain
+// fact anyone can verify on an explorer — not just text in the memo.
+export interface RelatedWallets {
+  userWallet?: string | null;
+  nodeWallet?: string | null;
+}
+
+function buildRelatedWalletKeys(relatedWallets?: RelatedWallets | null) {
+  const keys: { pubkey: PublicKey; isSigner: boolean; isWritable: boolean }[] = [];
+  if (!relatedWallets) return keys;
+  for (const address of [relatedWallets.userWallet, relatedWallets.nodeWallet]) {
+    if (!address) continue;
+    try {
+      keys.push({ pubkey: new PublicKey(address), isSigner: false, isWritable: false });
+    } catch {
+      // Wallet address wasn't a valid base58 pubkey (e.g. a placeholder
+      // identity) — skip it rather than fail the whole proof broadcast.
+    }
+  }
+  return keys;
+}
+
 export function buildMemoText(
   eventType: ProofEventType,
   nodePublicKey: string,
@@ -52,7 +77,10 @@ export function buildMemoText(
  * responding, so it cannot co-sign. The treasury attests to the fact that it
  * observed the node missing its heartbeat window, and pays the fee itself.
  */
-export async function buildAndSubmitTreasuryOnlyProof(memoText: string): Promise<string> {
+export async function buildAndSubmitTreasuryOnlyProof(
+  memoText: string,
+  relatedWallets?: RelatedWallets | null
+): Promise<string> {
   const treasuryKeypair = getTreasuryKeypair();
   if (!treasuryKeypair) {
     throw new Error("Treasury wallet is not configured (missing TREASURY_WALLET_PRIVATE_KEY)");
@@ -66,7 +94,7 @@ export async function buildAndSubmitTreasuryOnlyProof(memoText: string): Promise
     instructions: [
       {
         programId: MEMO_PROGRAM_ID,
-        keys: [],
+        keys: buildRelatedWalletKeys(relatedWallets),
         data: Buffer.from(memoText, "utf8"),
       },
     ],
@@ -96,7 +124,8 @@ export async function buildAndSubmitTreasuryOnlyProof(memoText: string): Promise
  */
 export async function buildUnsignedProofMessage(
   nodePublicKeyBase58: string,
-  memoText: string
+  memoText: string,
+  relatedWallets?: RelatedWallets | null
 ): Promise<{ messageBase64: string }> {
   const treasuryKeypair = getTreasuryKeypair();
   if (!treasuryKeypair) {
@@ -118,7 +147,10 @@ export async function buildUnsignedProofMessage(
     instructions: [
       {
         programId: MEMO_PROGRAM_ID,
-        keys: [{ pubkey: nodePubkey, isSigner: true, isWritable: false }],
+        keys: [
+          { pubkey: nodePubkey, isSigner: true, isWritable: false },
+          ...buildRelatedWalletKeys(relatedWallets),
+        ],
         data: Buffer.from(memoText, "utf8"),
       },
     ],

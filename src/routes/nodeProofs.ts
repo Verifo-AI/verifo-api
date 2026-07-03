@@ -4,7 +4,7 @@ import { db } from "@workspace/db";
 import { nodesTable, nodeProofEventsTable, tasksTable } from "@workspace/db/schema";
 import { eq, and, desc, inArray } from "drizzle-orm";
 import { authenticateNodeRequest } from "./nodeClient";
-import { buildMemoText, buildUnsignedProofMessage, buildAndSubmitTreasuryOnlyProof, finalizeAndSubmitProof, type ProofEventType, type TaskCompletedSettlement } from "../lib/solanaProofs";
+import { buildMemoText, buildUnsignedProofMessage, buildAndSubmitTreasuryOnlyProof, finalizeAndSubmitProof, type ProofEventType, type TaskCompletedSettlement, type RelatedWallets } from "../lib/solanaProofs";
 import { CREDIT_USDC_MICROS } from "./tasks";
 
 const router = Router();
@@ -20,9 +20,12 @@ const VALID_EVENT_TYPES: ProofEventType[] = ["connect", "disconnect", "task_assi
 // *co-signature* is skipped when the node itself is unreachable.
 const NODE_COSIGN_TIMEOUT_MS = 15_000;
 
-async function fallbackToTreasuryOnlyProof(memoText: string): Promise<{ txSignature: string; memoText: string }> {
+async function fallbackToTreasuryOnlyProof(
+  memoText: string,
+  relatedWallets?: RelatedWallets | null
+): Promise<{ txSignature: string; memoText: string }> {
   const fallbackMemoText = `${memoText} (node did not co-sign in time; treasury attests alone)`;
-  const txSignature = await buildAndSubmitTreasuryOnlyProof(fallbackMemoText);
+  const txSignature = await buildAndSubmitTreasuryOnlyProof(fallbackMemoText, relatedWallets);
   return { txSignature, memoText: fallbackMemoText };
 }
 
@@ -42,6 +45,11 @@ router.post("/nodes/proof", async (req, res) => {
 
     let resolvedTaskId: string | null = null;
     let settlement: TaskCompletedSettlement | null = null;
+    // Populated only for task_completed: lets the transaction itself carry
+    // the requesting user's wallet and the earning node's reward wallet as
+    // plain accounts, so the payer/payee relationship is verifiable
+    // on-chain, not just asserted in the memo text.
+    let relatedWallets: RelatedWallets | null = null;
     if (eventType === "task_assigned" || eventType === "task_completed") {
       if (typeof taskId !== "string" || !taskId) {
         return res.status(400).json({ error: "taskId is required for this event type" });
@@ -63,6 +71,9 @@ router.post("/nodes/proof", async (req, res) => {
           rewardUsdc: rewardMicros / 1_000_000,
           treasuryUsdc: Math.max(0, totalPaidMicros - rewardMicros) / 1_000_000,
         };
+        // task.clerkUserId stores the requesting user's Solana wallet
+        // address (see verifo-wallet-auth memory doc).
+        relatedWallets = { userWallet: task.clerkUserId };
       }
     }
 
@@ -70,9 +81,12 @@ router.post("/nodes/proof", async (req, res) => {
     if (!nodeRow?.nodePublicKey) {
       return res.status(404).json({ error: "Node identity not found" });
     }
+    if (relatedWallets) {
+      relatedWallets.nodeWallet = nodeRow.walletAddress;
+    }
 
     const memoText = buildMemoText(eventType as ProofEventType, nodeRow.nodePublicKey, resolvedTaskId, settlement);
-    const { messageBase64 } = await buildUnsignedProofMessage(nodeRow.nodePublicKey, memoText);
+    const { messageBase64 } = await buildUnsignedProofMessage(nodeRow.nodePublicKey, memoText, relatedWallets);
 
     const [proof] = await db
       .insert(nodeProofEventsTable)
@@ -195,7 +209,7 @@ router.get("/tasks/:taskId/proof", requireAuth, async (req: any, res) => {
       const totalPaidMicros = task.creditsUsed * CREDIT_USDC_MICROS;
       const rewardMicros = task.nodeRewardUsdcMicros ?? 0;
       const [node] = await db
-        .select({ nodePublicKey: nodesTable.nodePublicKey })
+        .select({ nodePublicKey: nodesTable.nodePublicKey, walletAddress: nodesTable.walletAddress })
         .from(nodesTable)
         .where(eq(nodesTable.id, task.assignedNodeId!))
         .limit(1);
@@ -206,8 +220,12 @@ router.get("/tasks/:taskId/proof", requireAuth, async (req: any, res) => {
           rewardUsdc: rewardMicros / 1_000_000,
           treasuryUsdc: Math.max(0, totalPaidMicros - rewardMicros) / 1_000_000,
         });
+      // Same on-chain payer/payee transparency as the happy-path co-signed
+      // proof above: attach the user's wallet and the node's reward wallet
+      // as accounts on the fallback memo transaction too.
+      const relatedWallets: RelatedWallets = { userWallet: task.clerkUserId, nodeWallet: node?.walletAddress };
       try {
-        const { txSignature, memoText } = await fallbackToTreasuryOnlyProof(baseMemoText);
+        const { txSignature, memoText } = await fallbackToTreasuryOnlyProof(baseMemoText, relatedWallets);
         if (proof) {
           [proof] = await db
             .update(nodeProofEventsTable)
