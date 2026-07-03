@@ -1,6 +1,7 @@
 import { Router, type IRouter } from "express";
 import { Expo, type ExpoPushMessage } from "expo-server-sdk";
-import { getCurrentNodeStatus, getTasks, computeEarnings, tickNode } from "../lib/nodeState.js";
+import { getCurrentNodeStatus, getTasks, computeEarnings } from "../lib/nodeState.js";
+import { checkForOfflineNodes } from "../lib/nodeOfflineWatcher.js";
 
 const router: IRouter = Router();
 const expo = new Expo();
@@ -36,7 +37,7 @@ async function sendPushMessages(messages: ExpoPushMessage[]): Promise<void> {
 }
 
 async function runPollerTick(): Promise<void> {
-  tickNode();
+  await checkForOfflineNodes().catch((err) => console.error("[notifications] offline check failed:", err));
 
   const records = Array.from(tokenRegistry.values()).filter(
     (r) => r.notificationsEnabled

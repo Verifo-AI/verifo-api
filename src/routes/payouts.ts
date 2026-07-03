@@ -121,7 +121,7 @@ router.post("/nodes/payout", requireAuth, async (req: any, res) => {
         success: true,
         amountUsdc: amountMicros / 1_000_000,
         solanaTxSignature: signature,
-        solanaExplorerUrl: `https://explorer.solana.com/tx/${signature}`,
+        solanaExplorerUrl: `https://orbmarkets.io/tx/${signature}`,
       });
     } catch (payoutErr: any) {
       logger.error({ err: payoutErr, nodeId: node.id }, "Real USDC payout failed, restoring pending balance");

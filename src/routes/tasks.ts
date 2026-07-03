@@ -12,11 +12,26 @@ import { BROWSER_MODE_REWARD_MULTIPLIER } from "../lib/contributionMode";
 // Fase 3: real USDC value backing each credit, matching the topup packages in
 // credits.ts (e.g. pack_100: 100 credits for $1 => 1 credit = $0.01). Reward
 // shares are a fraction of that real dollar value, in micro-USDC (1e6 = $1).
-const CREDIT_USDC_MICROS = 10_000; // $0.01 per credit
-const LOCAL_MODEL_REWARD_SHARE = 0.5; // node ran the model itself
-const RELAY_REWARD_SHARE = 0.1; // node responded honestly but had to relay
+export const CREDIT_USDC_MICROS = 10_000; // $0.01 per credit
+export const LOCAL_MODEL_REWARD_SHARE = 0.5; // node ran the model itself
+export const RELAY_REWARD_SHARE = 0.1; // node responded honestly but had to relay
 
-async function creditNodeReward(nodeId: number, share: number, creditsUsed: number): Promise<void> {
+// Shared with nodeProofs.ts so the on-chain task_completed memo can quote the
+// exact real reward amount instead of a generic message.
+export function computeRewardMicros(
+  source: string | null,
+  creditsUsed: number,
+  clientType: string | null | undefined
+): number {
+  let share: number;
+  if (source === "local_model") share = LOCAL_MODEL_REWARD_SHARE;
+  else if (source === "relayed") share = RELAY_REWARD_SHARE;
+  else return 0;
+  const effectiveShare = clientType === "browser" ? share * BROWSER_MODE_REWARD_MULTIPLIER : share;
+  return Math.round(creditsUsed * CREDIT_USDC_MICROS * effectiveShare);
+}
+
+async function creditNodeReward(nodeId: number, share: number, creditsUsed: number): Promise<number> {
   const [node] = await db
     .select({ clientType: nodesTable.clientType })
     .from(nodesTable)
@@ -27,11 +42,12 @@ async function creditNodeReward(nodeId: number, share: number, creditsUsed: numb
   // dedicated CLI process, so we never promise the same reward for it.
   const effectiveShare = node?.clientType === "browser" ? share * BROWSER_MODE_REWARD_MULTIPLIER : share;
   const amountMicros = Math.round(creditsUsed * CREDIT_USDC_MICROS * effectiveShare);
-  if (amountMicros <= 0) return;
+  if (amountMicros <= 0) return 0;
   await db
     .update(nodesTable)
     .set({ pendingRewardUsdcMicros: sql`${nodesTable.pendingRewardUsdcMicros} + ${amountMicros}` })
     .where(eq(nodesTable.id, nodeId));
+  return amountMicros;
 }
 
 const router = Router();
@@ -199,12 +215,16 @@ router.post("/tasks", requireAuth, async (req: any, res) => {
     // Reward the contributor node for real work: full credit for running the
     // model locally, a smaller relay credit if it engaged but had to fall
     // back to Claude. A node that never responded (timeout) earns nothing.
+    let nodeRewardMicros = 0;
     if (source === "local_model" && assignedNodeId !== null) {
       addCompletedTask("Inference: LLM Batch", parseFloat((creditsUsed * 0.08).toFixed(2)));
-      await creditNodeReward(assignedNodeId, LOCAL_MODEL_REWARD_SHARE, creditsUsed);
+      nodeRewardMicros = await creditNodeReward(assignedNodeId, LOCAL_MODEL_REWARD_SHARE, creditsUsed);
     } else if (nodeRelayed && assignedNodeId !== null) {
       addCompletedTask("Relayed to Claude (fallback)", parseFloat((creditsUsed * 0.02).toFixed(2)));
-      await creditNodeReward(assignedNodeId, RELAY_REWARD_SHARE, creditsUsed);
+      nodeRewardMicros = await creditNodeReward(assignedNodeId, RELAY_REWARD_SHARE, creditsUsed);
+    }
+    if (nodeRewardMicros > 0) {
+      await db.update(tasksTable).set({ nodeRewardUsdcMicros: nodeRewardMicros }).where(eq(tasksTable.id, task!.id));
     }
 
     await db.insert(proofsTable).values({

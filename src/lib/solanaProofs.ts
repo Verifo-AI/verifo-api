@@ -15,10 +15,15 @@ import { logger } from "./logger";
 // activity without deploying a custom on-chain program.
 export const MEMO_PROGRAM_ID = new PublicKey("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 
-export type ProofEventType = "connect" | "disconnect" | "task_assigned" | "task_completed";
+export type ProofEventType = "connect" | "disconnect" | "task_assigned" | "task_completed" | "node_offline";
 
 // All memo text is English-only by design (product requirement).
-export function buildMemoText(eventType: ProofEventType, nodePublicKey: string, taskId?: string | null): string {
+export function buildMemoText(
+  eventType: ProofEventType,
+  nodePublicKey: string,
+  taskId?: string | null,
+  rewardUsdc?: number | null
+): string {
   switch (eventType) {
     case "connect":
       return `Verifo node ${nodePublicKey} connected`;
@@ -27,8 +32,52 @@ export function buildMemoText(eventType: ProofEventType, nodePublicKey: string, 
     case "task_assigned":
       return `Verifo node ${nodePublicKey} picked up task ${taskId}`;
     case "task_completed":
-      return `Verifo node ${nodePublicKey} completed task ${taskId}`;
+      return typeof rewardUsdc === "number"
+        ? `Verifo node ${nodePublicKey} completed task ${taskId}, earned ${rewardUsdc.toFixed(6)} USDC`
+        : `Verifo node ${nodePublicKey} completed task ${taskId}`;
+    case "node_offline":
+      return `Verifo node ${nodePublicKey} went offline (missed heartbeat)`;
   }
+}
+
+/**
+ * Builds and broadcasts a treasury-ONLY signed Memo transaction. Used only
+ * for the node_offline event: by definition the node has stopped
+ * responding, so it cannot co-sign. The treasury attests to the fact that it
+ * observed the node missing its heartbeat window, and pays the fee itself.
+ */
+export async function buildAndSubmitTreasuryOnlyProof(memoText: string): Promise<string> {
+  const treasuryKeypair = getTreasuryKeypair();
+  if (!treasuryKeypair) {
+    throw new Error("Treasury wallet is not configured (missing TREASURY_WALLET_PRIVATE_KEY)");
+  }
+
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("finalized");
+
+  const message = new TransactionMessage({
+    payerKey: treasuryKeypair.publicKey,
+    recentBlockhash: blockhash,
+    instructions: [
+      {
+        programId: MEMO_PROGRAM_ID,
+        keys: [],
+        data: Buffer.from(memoText, "utf8"),
+      },
+    ],
+  }).compileToV0Message();
+
+  const transaction = new VersionedTransaction(message);
+  transaction.sign([treasuryKeypair]);
+
+  const signature = await connection.sendTransaction(transaction, {
+    skipPreflight: false,
+    maxRetries: 3,
+  });
+
+  await connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, "confirmed");
+
+  logger.info({ signature }, "[solanaProofs] treasury-only node_offline proof confirmed");
+  return signature;
 }
 
 /**

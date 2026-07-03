@@ -25,6 +25,7 @@ router.post("/nodes/proof", async (req, res) => {
     }
 
     let resolvedTaskId: string | null = null;
+    let rewardUsdc: number | null = null;
     if (eventType === "task_assigned" || eventType === "task_completed") {
       if (typeof taskId !== "string" || !taskId) {
         return res.status(400).json({ error: "taskId is required for this event type" });
@@ -34,6 +35,9 @@ router.post("/nodes/proof", async (req, res) => {
         return res.status(404).json({ error: "Task not found for this node" });
       }
       resolvedTaskId = taskId;
+      if (eventType === "task_completed" && task.nodeRewardUsdcMicros > 0) {
+        rewardUsdc = task.nodeRewardUsdcMicros / 1_000_000;
+      }
     }
 
     const [nodeRow] = await db.select().from(nodesTable).where(eq(nodesTable.id, node.id)).limit(1);
@@ -41,7 +45,7 @@ router.post("/nodes/proof", async (req, res) => {
       return res.status(404).json({ error: "Node identity not found" });
     }
 
-    const memoText = buildMemoText(eventType as ProofEventType, nodeRow.nodePublicKey, resolvedTaskId);
+    const memoText = buildMemoText(eventType as ProofEventType, nodeRow.nodePublicKey, resolvedTaskId, rewardUsdc);
     const { messageBase64 } = await buildUnsignedProofMessage(nodeRow.nodePublicKey, memoText);
 
     const [proof] = await db
