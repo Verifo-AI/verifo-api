@@ -20,12 +20,9 @@ const VALID_EVENT_TYPES: ProofEventType[] = ["connect", "disconnect", "task_assi
 // *co-signature* is skipped when the node itself is unreachable.
 const NODE_COSIGN_TIMEOUT_MS = 15_000;
 
-async function fallbackToTreasuryOnlyProof(
-  memoText: string,
-  relatedWallets?: RelatedWallets | null
-): Promise<{ txSignature: string; memoText: string }> {
+async function fallbackToTreasuryOnlyProof(memoText: string): Promise<{ txSignature: string; memoText: string }> {
   const fallbackMemoText = `${memoText} (node did not co-sign in time; treasury attests alone)`;
-  const txSignature = await buildAndSubmitTreasuryOnlyProof(fallbackMemoText, relatedWallets);
+  const txSignature = await buildAndSubmitTreasuryOnlyProof(fallbackMemoText);
   return { txSignature, memoText: fallbackMemoText };
 }
 
@@ -85,8 +82,8 @@ router.post("/nodes/proof", async (req, res) => {
       relatedWallets.nodeWallet = nodeRow.walletAddress;
     }
 
-    const memoText = buildMemoText(eventType as ProofEventType, nodeRow.nodePublicKey, resolvedTaskId, settlement);
-    const { messageBase64 } = await buildUnsignedProofMessage(nodeRow.nodePublicKey, memoText, relatedWallets);
+    const memoText = buildMemoText(eventType as ProofEventType, nodeRow.nodePublicKey, resolvedTaskId, settlement, relatedWallets);
+    const { messageBase64 } = await buildUnsignedProofMessage(nodeRow.nodePublicKey, memoText);
 
     const [proof] = await db
       .insert(nodeProofEventsTable)
@@ -213,19 +210,27 @@ router.get("/tasks/:taskId/proof", requireAuth, async (req: any, res) => {
         .from(nodesTable)
         .where(eq(nodesTable.id, task.assignedNodeId!))
         .limit(1);
+      // Same on-chain payer/payee transparency as the happy-path co-signed
+      // proof above: name the user's wallet and the node's reward wallet in
+      // the fallback memo text too (can't attach them as instruction
+      // accounts — the SPL Memo program requires every account it's given
+      // to also be a signer, which neither of these wallets can do here).
+      const relatedWallets: RelatedWallets = { userWallet: task.clerkUserId, nodeWallet: node?.walletAddress };
       const baseMemoText =
         proof?.memoText ??
-        buildMemoText("task_completed", node?.nodePublicKey ?? "unknown", taskId, {
-          totalPaidUsdc: totalPaidMicros / 1_000_000,
-          rewardUsdc: rewardMicros / 1_000_000,
-          treasuryUsdc: Math.max(0, totalPaidMicros - rewardMicros) / 1_000_000,
-        });
-      // Same on-chain payer/payee transparency as the happy-path co-signed
-      // proof above: attach the user's wallet and the node's reward wallet
-      // as accounts on the fallback memo transaction too.
-      const relatedWallets: RelatedWallets = { userWallet: task.clerkUserId, nodeWallet: node?.walletAddress };
+        buildMemoText(
+          "task_completed",
+          node?.nodePublicKey ?? "unknown",
+          taskId,
+          {
+            totalPaidUsdc: totalPaidMicros / 1_000_000,
+            rewardUsdc: rewardMicros / 1_000_000,
+            treasuryUsdc: Math.max(0, totalPaidMicros - rewardMicros) / 1_000_000,
+          },
+          relatedWallets
+        );
       try {
-        const { txSignature, memoText } = await fallbackToTreasuryOnlyProof(baseMemoText, relatedWallets);
+        const { txSignature, memoText } = await fallbackToTreasuryOnlyProof(baseMemoText);
         if (proof) {
           [proof] = await db
             .update(nodeProofEventsTable)

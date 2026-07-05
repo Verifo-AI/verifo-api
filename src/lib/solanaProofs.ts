@@ -25,35 +25,24 @@ export interface TaskCompletedSettlement {
 }
 
 // For task_completed proofs, the requesting user's wallet and the earning
-// node's reward wallet are attached to the transaction as plain (non-signer,
-// non-writable) accounts. The treasury still pays gas and is the only
-// required signer, but this makes the payer/payee relationship an on-chain
-// fact anyone can verify on an explorer — not just text in the memo.
+// node's reward wallet are named directly in the memo TEXT (not attached as
+// separate instruction accounts — the SPL Memo program rejects any
+// transaction where an account it was given isn't also a signer, so a
+// "plain, non-signer" account reference is not actually possible on this
+// program). Embedding the addresses in the memo text keeps them just as
+// permanently on-chain and human/explorer-verifiable, without needing
+// either party's signature.
 export interface RelatedWallets {
   userWallet?: string | null;
   nodeWallet?: string | null;
-}
-
-function buildRelatedWalletKeys(relatedWallets?: RelatedWallets | null) {
-  const keys: { pubkey: PublicKey; isSigner: boolean; isWritable: boolean }[] = [];
-  if (!relatedWallets) return keys;
-  for (const address of [relatedWallets.userWallet, relatedWallets.nodeWallet]) {
-    if (!address) continue;
-    try {
-      keys.push({ pubkey: new PublicKey(address), isSigner: false, isWritable: false });
-    } catch {
-      // Wallet address wasn't a valid base58 pubkey (e.g. a placeholder
-      // identity) — skip it rather than fail the whole proof broadcast.
-    }
-  }
-  return keys;
 }
 
 export function buildMemoText(
   eventType: ProofEventType,
   nodePublicKey: string,
   taskId?: string | null,
-  settlement?: TaskCompletedSettlement | null
+  settlement?: TaskCompletedSettlement | null,
+  relatedWallets?: RelatedWallets | null
 ): string {
   switch (eventType) {
     case "connect":
@@ -62,10 +51,20 @@ export function buildMemoText(
       return `Verifo node ${nodePublicKey} disconnected`;
     case "task_assigned":
       return `Verifo node ${nodePublicKey} picked up task ${taskId}`;
-    case "task_completed":
+    case "task_completed": {
+      const walletSuffix = relatedWallets
+        ? [
+            relatedWallets.userWallet ? `user wallet ${relatedWallets.userWallet}` : null,
+            relatedWallets.nodeWallet ? `node reward wallet ${relatedWallets.nodeWallet}` : null,
+          ]
+            .filter(Boolean)
+            .join(", ")
+        : "";
+      const walletText = walletSuffix ? ` (${walletSuffix})` : "";
       return settlement
-        ? `Verifo node ${nodePublicKey} completed task ${taskId}. Settlement: user paid ${settlement.totalPaidUsdc.toFixed(6)} USDC, node earned ${settlement.rewardUsdc.toFixed(6)} USDC, platform treasury kept ${settlement.treasuryUsdc.toFixed(6)} USDC`
-        : `Verifo node ${nodePublicKey} completed task ${taskId}`;
+        ? `Verifo node ${nodePublicKey} completed task ${taskId}. Settlement: user paid ${settlement.totalPaidUsdc.toFixed(6)} USDC, node earned ${settlement.rewardUsdc.toFixed(6)} USDC, platform treasury kept ${settlement.treasuryUsdc.toFixed(6)} USDC${walletText}`
+        : `Verifo node ${nodePublicKey} completed task ${taskId}${walletText}`;
+    }
     case "node_offline":
       return `Verifo node ${nodePublicKey} went offline (missed heartbeat)`;
   }
@@ -77,10 +76,7 @@ export function buildMemoText(
  * responding, so it cannot co-sign. The treasury attests to the fact that it
  * observed the node missing its heartbeat window, and pays the fee itself.
  */
-export async function buildAndSubmitTreasuryOnlyProof(
-  memoText: string,
-  relatedWallets?: RelatedWallets | null
-): Promise<string> {
+export async function buildAndSubmitTreasuryOnlyProof(memoText: string): Promise<string> {
   const treasuryKeypair = getTreasuryKeypair();
   if (!treasuryKeypair) {
     throw new Error("Treasury wallet is not configured (missing TREASURY_WALLET_PRIVATE_KEY)");
@@ -94,7 +90,10 @@ export async function buildAndSubmitTreasuryOnlyProof(
     instructions: [
       {
         programId: MEMO_PROGRAM_ID,
-        keys: buildRelatedWalletKeys(relatedWallets),
+        // No extra accounts here — the SPL Memo program requires every
+        // account it's given to also be a signer, so related wallets are
+        // named in the memo text instead (see buildMemoText).
+        keys: [],
         data: Buffer.from(memoText, "utf8"),
       },
     ],
@@ -124,8 +123,7 @@ export async function buildAndSubmitTreasuryOnlyProof(
  */
 export async function buildUnsignedProofMessage(
   nodePublicKeyBase58: string,
-  memoText: string,
-  relatedWallets?: RelatedWallets | null
+  memoText: string
 ): Promise<{ messageBase64: string }> {
   const treasuryKeypair = getTreasuryKeypair();
   if (!treasuryKeypair) {
@@ -147,10 +145,11 @@ export async function buildUnsignedProofMessage(
     instructions: [
       {
         programId: MEMO_PROGRAM_ID,
-        keys: [
-          { pubkey: nodePubkey, isSigner: true, isWritable: false },
-          ...buildRelatedWalletKeys(relatedWallets),
-        ],
+        // Only the node's own key is passed as an account here (and it IS
+        // a real signer, co-signed by the node below) — related wallets
+        // are named in the memo text instead, since the SPL Memo program
+        // requires every account it's given to also be a signer.
+        keys: [{ pubkey: nodePubkey, isSigner: true, isWritable: false }],
         data: Buffer.from(memoText, "utf8"),
       },
     ],
