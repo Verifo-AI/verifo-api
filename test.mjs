@@ -24,16 +24,39 @@ const dbDir = path.resolve(artifactDir, "../../lib/db");
 const drizzleConfig = path.join(dbDir, "drizzle.config.ts");
 const drizzleKit = path.join(dbDir, "node_modules/.bin/drizzle-kit");
 
-console.log("\nApplying migrations to test database via drizzle-kit migrate...");
-execSync(`${drizzleKit} migrate --config ${drizzleConfig}`, {
+// The dev database's schema is kept in sync via `drizzle-kit push` (not
+// `migrate`), so the migrations/ folder is stale relative to the live
+// schema. Push the current schema.ts directly to the test DB instead of
+// replaying outdated migration files, so the test DB actually matches what
+// dev/prod run against.
+//
+// Reset to an empty public schema first: pushing against a DB that already
+// has an old, partial set of tables/columns makes drizzle-kit try to guess
+// whether a changed column is an add or a rename, which requires an
+// interactive prompt (fails with no TTY in this script). Starting from
+// empty removes all ambiguity.
+console.log("\nResetting test database schema...");
+// `pg` isn't a direct dependency of this package (only of lib/db, via
+// drizzle), so resolve it through lib/db's own require to avoid pnpm's
+// strict dependency resolution rejecting the bare import.
+const dbRequire = createRequire(path.join(dbDir, "package.json"));
+const { Client } = dbRequire("pg");
+const resetClient = new Client({ connectionString: process.env.TEST_DATABASE_URL });
+await resetClient.connect();
+await resetClient.query("DROP SCHEMA public CASCADE; CREATE SCHEMA public;");
+await resetClient.end();
+
+console.log("Syncing test database schema via drizzle-kit push...");
+execSync(`${drizzleKit} push --force --config ${drizzleConfig}`, {
   stdio: "inherit",
   env: { ...process.env, DATABASE_URL: process.env.TEST_DATABASE_URL },
 });
-console.log("Test database migrations applied.\n");
+console.log("Test database schema synced.\n");
 
 const testSuites = [
   "src/tests/earnings-persistence.test.ts",
   "src/tests/credits-nodes-smoke.test.ts",
+  "src/tests/three-fixes-e2e.test.ts",
 ];
 
 const esbuildBanner = {
@@ -49,7 +72,12 @@ globalThis.__dirname = __bannerPath.dirname(globalThis.__filename);
 let overallFailed = false;
 
 for (const suite of testSuites) {
-  const outDir = await mkdtemp(path.join(os.tmpdir(), "verifo-test-"));
+  // Build inside the package's own directory (not the system tmpdir) so
+  // externalized workspace packages (e.g. @workspace/verifo-node-client)
+  // still resolve via normal Node module resolution walking up to this
+  // package's node_modules — the same reason build.mjs's dist/ output also
+  // stays inside artifacts/api-server instead of somewhere outside the repo.
+  const outDir = await mkdtemp(path.join(artifactDir, ".test-build-"));
   const entryPoint = path.resolve(artifactDir, suite);
   const outFile = path.join(outDir, path.basename(suite).replace(/\.ts$/, ".mjs"));
 
@@ -66,7 +94,12 @@ for (const suite of testSuites) {
       outdir: outDir,
       outExtension: { ".js": ".mjs" },
       logLevel: "info",
-      external: ["*.node", "pg-native"],
+      // Mirror build.mjs's externals: nodeClient.ts pulls in
+      // @workspace/verifo-node-client's build-dist.mjs, which uses esbuild's
+      // own JS API at runtime to zip the node client — esbuild refuses to run
+      // if it detects itself bundled into another file, so both it and the
+      // package that calls it must stay external here too.
+      external: ["*.node", "pg-native", "esbuild", "@workspace/verifo-node-client", "@workspace/verifo-node-client/*"],
       plugins: [esbuildPluginPino({ transports: ["pino-pretty"] })],
       banner: esbuildBanner,
     });

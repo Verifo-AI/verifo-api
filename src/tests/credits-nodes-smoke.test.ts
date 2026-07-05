@@ -184,7 +184,8 @@ test("POST /api/credits/topup second top-up accumulates credits", async () => {
 // ---------------------------------------------------------------------------
 
 test("GET /api/nodes/status returns 200 with valid shape", async () => {
-  const { status, body } = await request(server, "GET", "/api/nodes/status");
+  const token = makeToken(TEST_WALLET);
+  const { status, body } = await request(server, "GET", "/api/nodes/status", { token });
   const data = body as {
     nodeId: string;
     region: string;
@@ -218,7 +219,8 @@ test("GET /api/nodes/status returns 200 with valid shape", async () => {
 // ---------------------------------------------------------------------------
 
 test("GET /api/nodes/tasks returns 200 with valid shape", async () => {
-  const { status, body } = await request(server, "GET", "/api/nodes/tasks");
+  const token = makeToken(TEST_WALLET);
+  const { status, body } = await request(server, "GET", "/api/nodes/tasks", { token });
   const data = body as { tasks: unknown[]; total: number };
 
   assert.equal(status, 200, "status should be 200");
@@ -228,14 +230,16 @@ test("GET /api/nodes/tasks returns 200 with valid shape", async () => {
 });
 
 test("GET /api/nodes/tasks respects limit query param", async () => {
-  const { body } = await request(server, "GET", "/api/nodes/tasks?limit=3");
+  const token = makeToken(TEST_WALLET);
+  const { body } = await request(server, "GET", "/api/nodes/tasks?limit=3", { token });
   const data = body as { tasks: unknown[]; total: number };
 
   assert.ok(data.tasks.length <= 3, "returned tasks should not exceed the requested limit");
 });
 
 test("GET /api/nodes/tasks with status filter returns 200", async () => {
-  const { status } = await request(server, "GET", "/api/nodes/tasks?status=completed");
+  const token = makeToken(TEST_WALLET);
+  const { status } = await request(server, "GET", "/api/nodes/tasks?status=completed", { token });
   assert.equal(status, 200, "status filter should still return 200");
 });
 
