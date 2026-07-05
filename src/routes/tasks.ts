@@ -6,7 +6,6 @@ import { eq, desc, and, sql } from "drizzle-orm";
 import { anthropic } from "@workspace/integrations-anthropic-ai";
 import { generateImageBuffer } from "@workspace/integrations-openai-ai-server/image";
 import { findAvailableNode, assignTaskToNode, finalizeReward } from "../lib/taskRouter";
-import { BROWSER_MODE_REWARD_MULTIPLIER } from "../lib/contributionMode";
 import { sendUsdcPayout, isTreasuryConfigured } from "../lib/solanaTreasury";
 import { logger } from "../lib/logger";
 
@@ -31,11 +30,16 @@ export const TREASURY_SHARE = 1 - NODE_REWARD_SHARE; // platform's share
 export function computeRewardMicros(
   source: string | null,
   creditsUsed: number,
-  clientType: string | null | undefined
+  _clientType?: string | null | undefined
 ): number {
   if (source !== "local_model" && source !== "relayed") return 0;
-  const effectiveShare = clientType === "browser" ? NODE_REWARD_SHARE * BROWSER_MODE_REWARD_MULTIPLIER : NODE_REWARD_SHARE;
-  return Math.round(creditsUsed * CREDIT_USDC_MICROS * effectiveShare);
+  // Flat 70% for every node that did real work on a task, regardless of
+  // clientType (browser tab vs CLI). The browser-mode discount only applies
+  // to the passive witness heartbeat reward (see BROWSER_MODE_REWARD_MULTIPLIER
+  // in contributionMode.ts / nodeClient.ts) — it must never touch task
+  // rewards, or a browser-mode node doing real relay/compute work for a task
+  // silently gets shorted below the advertised 70/30 split.
+  return Math.round(creditsUsed * CREDIT_USDC_MICROS * NODE_REWARD_SHARE);
 }
 
 export type RewardPayoutStatus = "not_applicable" | "paid" | "failed";
@@ -62,11 +66,12 @@ async function payNodeRewardOnChain(nodeId: number, share: number, creditsUsed: 
 
   if (!node) return { amountMicros: 0, status: "not_applicable", txSignature: null };
 
-  // Browser Mode nodes earn less per task, same reason as the heartbeat
-  // reward: uptime tied to an open tab is inherently less reliable than a
-  // dedicated CLI process, so we never promise the same reward for it.
-  const effectiveShare = node.clientType === "browser" ? share * BROWSER_MODE_REWARD_MULTIPLIER : share;
-  const amountMicros = Math.round(creditsUsed * CREDIT_USDC_MICROS * effectiveShare);
+  // Flat share for every node that did real work on a task — no browser-mode
+  // discount here. The browser-mode discount only applies to the passive
+  // witness heartbeat reward (uptime-only, no actual work done); a
+  // browser-mode node that ran/relayed a real task earns the full advertised
+  // share just like a CLI node.
+  const amountMicros = Math.round(creditsUsed * CREDIT_USDC_MICROS * share);
   if (amountMicros <= 0) return { amountMicros: 0, status: "not_applicable", txSignature: null };
 
   if (!isTreasuryConfigured()) {
@@ -220,55 +225,79 @@ router.post("/tasks", requireAuth, async (req: any, res) => {
     let assignedNodeId: number | null = null;
     let nodeRelayed = false;
 
-    if (type === "image_generation") {
-      // Claude (Anthropic) has no image-generation capability, and
-      // contributor nodes only run local text LLMs, so image tasks can never
-      // be routed to a node or Claude honestly — they always go straight to
-      // OpenAI's gpt-image-1 via an internal AI proxy. Stored as a data URL
-      // in `response` so the existing text-shaped task pipeline (DB column,
-      // proof memo, history list) doesn't need a schema change; the frontend
-      // renders it as an <img> instead of markdown for this task type.
+    // Pick exactly one candidate — findAvailableNode already prioritizes
+    // real online contributors (compute, then relay) over the 16 platform
+    // fallback nodes, with a random tie-break within each tier. We never
+    // retry to a *different* node just because this one is slow to answer:
+    // for relay-mode contributors (and browser nodes with a backgrounded
+    // tab, which is normal real-world usage) not producing a local-model
+    // answer within the timeout is expected, not a failure — the node was
+    // genuinely online when picked, so it still earns the relay reward.
+    // Rerouting on timeout used to let a real, online contributor's task
+    // get silently handed to a platform node instead, which is exactly the
+    // "always goes to our own 16" behavior contributors complained about.
+    // Falling through to the platform tier only happens naturally, when no
+    // real contributor is online at all (findAvailableNode picks one of
+    // the 16 itself in that case). See verifo-platform-fallback-nodes memory doc.
+    //
+    // This routing/reward step runs identically for EVERY task type,
+    // including image_generation: no contributor node can actually run a
+    // local image model, so a node is always "relaying" an image task the
+    // same way it relays a text task it can't run locally — it still did
+    // the job of being online and available, so it still earns the reward,
+    // exactly like coding/translation/research/chat tasks do.
+    const node = await findAvailableNode();
+    let nodeResult: Awaited<ReturnType<typeof assignTaskToNode>> = null;
+    if (node) {
+      assignedNodeId = node.id;
+      nodeResult = await assignTaskToNode(node.id, { taskId, prompt, type });
+    }
+
+    if (nodeResult?.ok && type !== "image_generation") {
+      response = nodeResult.output;
+      source = "local_model";
+    } else if (type === "image_generation") {
+      // Claude has no image-generation capability and contributor nodes only
+      // run local text LLMs, so the actual pixels always come from OpenAI's
+      // gpt-image-1 via the hosted AI provider proxy regardless of whether a node
+      // was assigned above. Stored as a data URL in `response` so the
+      // existing text-shaped task pipeline (DB column, proof memo, history
+      // list) doesn't need a schema change; the frontend renders it as an
+      // <img> instead of markdown for this task type.
+      nodeRelayed = assignedNodeId !== null;
       const imageBuffer = await generateImageBuffer(prompt, "1024x1024");
       response = `data:image/png;base64,${imageBuffer.toString("base64")}`;
       source = "fallback_openai_image";
+    } else if (assignedNodeId !== null) {
+      // The node was verified online and picked for this task — whether it
+      // explicitly declined (no local model) or never responded in time,
+      // it still gets credited as the relay for this task and earns the
+      // reward. Only a task where NO node was available at all (handled in
+      // the else branch below) pays nothing.
+      nodeRelayed = true;
+      const completion = await anthropic.messages.create({
+        model,
+        max_tokens: 1024,
+        system: systemPrompt,
+        messages: [{ role: "user", content: prompt }],
+      });
+      response = completion.content
+        .filter((block) => block.type === "text")
+        .map((block) => (block as { type: "text"; text: string }).text)
+        .join("");
+      source = "fallback_claude";
     } else {
-      const node = await findAvailableNode();
-
-      if (node) {
-        assignedNodeId = node.id;
-        const nodeResult = await assignTaskToNode(node.id, { taskId, prompt, type });
-        if (nodeResult?.ok) {
-          response = nodeResult.output;
-          source = "local_model";
-        } else {
-          // Either the node explicitly said it can't run this locally, or it
-          // timed out. Only credit it for relaying if it actively responded.
-          nodeRelayed = nodeResult !== null;
-          const completion = await anthropic.messages.create({
-            model,
-            max_tokens: 1024,
-            system: systemPrompt,
-            messages: [{ role: "user", content: prompt }],
-          });
-          response = completion.content
-            .filter((block) => block.type === "text")
-            .map((block) => (block as { type: "text"; text: string }).text)
-            .join("");
-          source = "fallback_claude";
-        }
-      } else {
-        const completion = await anthropic.messages.create({
-          model,
-          max_tokens: 1024,
-          system: systemPrompt,
-          messages: [{ role: "user", content: prompt }],
-        });
-        response = completion.content
-          .filter((block) => block.type === "text")
-          .map((block) => (block as { type: "text"; text: string }).text)
-          .join("");
-        source = "fallback_claude";
-      }
+      const completion = await anthropic.messages.create({
+        model,
+        max_tokens: 1024,
+        system: systemPrompt,
+        messages: [{ role: "user", content: prompt }],
+      });
+      response = completion.content
+        .filter((block) => block.type === "text")
+        .map((block) => (block as { type: "text"; text: string }).text)
+        .join("");
+      source = "fallback_claude";
     }
 
     const now = new Date();

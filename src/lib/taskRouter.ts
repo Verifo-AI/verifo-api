@@ -81,9 +81,12 @@ const assignedTaskByNodeId = new Map<number, AssignedTask>();
 // relay nodes are only used when no compute node is online.
 const TASK_ELIGIBLE_CONTRIBUTION_MODES = ["compute", "relay"] as const;
 
-export async function findAvailableNode(): Promise<{ id: number; clerkUserId: string; walletAddress: string } | null> {
+export async function findAvailableNode(): Promise<{
+  id: number;
+  clerkUserId: string;
+  walletAddress: string;
+} | null> {
   const cutoff = new Date(Date.now() - NODE_ONLINE_WINDOW_MS);
-  const excludeIds = [...busyNodeIds];
 
   const eligibilityFilter = and(
     eq(nodesTable.verified, true),
@@ -94,7 +97,7 @@ export async function findAvailableNode(): Promise<{ id: number; clerkUserId: st
   const candidates = await db
     .select({ id: nodesTable.id, clerkUserId: nodesTable.clerkUserId, walletAddress: nodesTable.walletAddress })
     .from(nodesTable)
-    .where(excludeIds.length > 0 ? and(eligibilityFilter, notInArray(nodesTable.id, excludeIds)) : eligibilityFilter)
+    .where(busyNodeIds.size > 0 ? and(eligibilityFilter, notInArray(nodesTable.id, [...busyNodeIds])) : eligibilityFilter)
     // Real contributor nodes always come first (compute, then relay). Platform-
     // operated fallback nodes (isPlatformNode) are only ever picked when no real
     // contributor is online, so genuine contributors get first shot at task
