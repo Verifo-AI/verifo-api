@@ -2,8 +2,8 @@
 // (platform_node_credentials). Previously these were stored as plaintext
 // base64/base58 strings, so anyone with read access to the DB (a leak, a
 // backup, an over-privileged query) could sign transactions and drain the
-// platform nodes' payout wallets. AES-256-GCM with a key held only in
-// a dedicated secrets manager (never in the DB) closes that gap: a DB-only leak no
+// platform nodes' payout wallets. AES-256-GCM with a key held only in a
+// managed secrets store (never in the DB) closes that gap: a DB-only leak no
 // longer exposes usable keys.
 import crypto from "node:crypto";
 
