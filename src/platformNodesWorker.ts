@@ -12,14 +12,94 @@
 // Claude fallback + RELAY_REWARD_SHARE reward path in tasks.ts.
 import nacl from "tweetnacl";
 import bs58 from "bs58";
+import { Keypair } from "@solana/web3.js";
 import { db, nodesTable, platformNodeCredentialsTable } from "@workspace/db";
 import { eq } from "drizzle-orm";
 import { logger } from "./lib/logger";
-import { decryptSecret } from "./lib/credentialsCrypto";
+import { decryptSecret, encryptSecret } from "./lib/credentialsCrypto";
 
 const API_BASE = `http://localhost:${process.env["PORT"] ?? "8080"}/api`;
 const HEARTBEAT_INTERVAL_MS = 25_000;
 const POLL_INTERVAL_MS = 2_000;
+const PLATFORM_NODE_COUNT = 16;
+
+// Same varied server-class hardware specs used by scripts/seedPlatformNodes.ts
+// — kept in sync here so the in-process auto-seed (below) produces identical
+// looking node rows to the original one-off script.
+const HARDWARE_PROFILES = [
+  { cpu: "AMD EPYC 7443P", ramGb: 32 },
+  { cpu: "Intel Xeon Gold 6338", ramGb: 64 },
+  { cpu: "AMD EPYC 7313", ramGb: 32 },
+  { cpu: "Intel Xeon Silver 4314", ramGb: 48 },
+];
+
+// Auto-seeds the 16 platform fallback nodes directly in whichever database
+// this process is actually connected to (dev or production), the first time
+// this worker boots and finds none present. This replaces relying on someone
+// remembering to run scripts/seedPlatformNodes.ts by hand against production
+// — which never happened, leaving production with 0 platform nodes and only
+// whatever real contributor nodes happened to be online (sometimes exactly
+// one), which is why task routing looked "stuck" on a single node instead of
+// spreading randomly across 16. Idempotent: if any platform node row already
+// exists, this is a no-op, so it's safe to call on every boot.
+export async function seedPlatformNodesIfMissing(): Promise<void> {
+  const existing = await db
+    .select({ id: nodesTable.id })
+    .from(nodesTable)
+    .where(eq(nodesTable.isPlatformNode, true))
+    .limit(1);
+
+  if (existing.length > 0) return;
+
+  logger.info("No platform nodes found in this database — auto-seeding 16 platform fallback nodes now.");
+
+  for (let i = 1; i <= PLATFORM_NODE_COUNT; i++) {
+    const identity = nacl.sign.keyPair();
+    const nodePublicKey = bs58.encode(Buffer.from(identity.publicKey));
+    const nodeSecretKeyBase64 = Buffer.from(identity.secretKey).toString("base64");
+
+    // Each node gets its own freshly-generated, real Solana wallet — never
+    // the treasury wallet — so on-chain rewards for that node's work always
+    // pay out to a distinct address that only this node's encrypted secret
+    // key can spend from.
+    const wallet = Keypair.generate();
+    const walletAddress = wallet.publicKey.toBase58();
+    const walletSecretKeyBase58 = bs58.encode(wallet.secretKey);
+
+    const profile = HARDWARE_PROFILES[(i - 1) % HARDWARE_PROFILES.length]!;
+
+    const [node] = await db
+      .insert(nodesTable)
+      .values({
+        clerkUserId: `platform_node_${i}`,
+        nodeType: "verification",
+        os: "linux",
+        hardware: `Verifo Official Platform Node #${i}`,
+        walletAddress,
+        status: "active",
+        nodePublicKey,
+        verified: true,
+        lastSeenAt: new Date(),
+        reportedOs: "linux",
+        reportedCpu: profile.cpu,
+        reportedGpu: null,
+        reportedRamGb: profile.ramGb,
+        contributionMode: "relay",
+        isPlatformNode: true,
+      })
+      .returning();
+
+    await db.insert(platformNodeCredentialsTable).values({
+      nodeId: node!.id,
+      nodeSecretKeyBase64: encryptSecret(nodeSecretKeyBase64),
+      walletSecretKeyBase58: encryptSecret(walletSecretKeyBase58),
+    });
+
+    logger.info({ nodeId: node!.id, walletAddress }, `Auto-seeded platform node #${i}`);
+  }
+
+  logger.info(`Auto-seeded ${PLATFORM_NODE_COUNT} platform nodes.`);
+}
 
 interface PlatformNodeIdentity {
   nodeId: number;
@@ -212,6 +292,10 @@ async function main() {
     return;
   }
 
+  await seedPlatformNodesIfMissing().catch((err) => {
+    logger.error({ err }, "Auto-seeding platform nodes failed — continuing with whatever identities exist");
+  });
+
   const identities = await loadIdentities();
   if (identities.length === 0) {
     logger.error("No platform node identities found in DB. Run scripts/seedPlatformNodes.ts first.");
@@ -226,6 +310,13 @@ async function main() {
   process.on("SIGTERM", () => void handleShutdown(identities, "SIGTERM"));
 }
 
+// This file has a side-effecting top-level call so importing it (e.g. from
+// index.ts, to run the worker in-process inside the already-deployed API
+// Server instead of as a separate, never-actually-deployed service) is
+// itself enough to start it. It's also run standalone via the
+// "platform-nodes-worker" pnpm script / dev workflow for local testing.
+// Both call sites are safe together: everything here is idempotent and
+// no-ops outside production (see the NODE_ENV check above).
 main().catch((err) => {
   logger.error({ err }, "platform-nodes worker crashed");
   process.exit(1);

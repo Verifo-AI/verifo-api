@@ -2,6 +2,15 @@ import app from "./app";
 import { logger } from "./lib/logger";
 import { initNodeEarnings } from "./lib/nodeState.js";
 
+// Runs the platform-operated fallback nodes (auto-seeds them into this
+// process's own database on first boot if missing, then keeps their
+// heartbeats/proofs going) in-process, inside the already-deployed API
+// Server. This file no-ops outside production, so importing it here is
+// safe in dev too — see platformNodesWorker.ts for details. This replaces
+// depending on the separate "Platform Nodes Worker" dev workflow, which was
+// never actually part of the production deployment.
+import "./platformNodesWorker.js";
+
 // Solana RPC calls (proof submission, confirmations) can throw outside the
 // request's own promise chain when the underlying transport hits a
 // rate-limit (HTTP 429) or transient network error deep inside
