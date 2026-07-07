@@ -10,6 +10,7 @@ import authRouter from "./auth";
 import payoutsRouter from "./payouts";
 import nodeProofsRouter from "./nodeProofs";
 import solanaRpcRouter from "./solanaRpc";
+import publicExplorerRouter from "./publicExplorer";
 
 const router: IRouter = Router();
 
@@ -24,5 +25,6 @@ router.use(notificationsRouter);
 router.use(payoutsRouter);
 router.use(nodeProofsRouter);
 router.use(solanaRpcRouter);
+router.use(publicExplorerRouter);
 
 export default router;
